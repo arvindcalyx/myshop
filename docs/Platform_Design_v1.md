@@ -1,11 +1,22 @@
 # Platform Design v1 — MVP Spec
 
-**Status:** v1.2 draft for review (S1 Design) · 2026-10-21 · Arvind
-**Supersedes:** v1.1 (commit `c096573`) and v1.0 (commit `49b8aa1`), same file. Change summary in §0.
+**Status:** v1.3 draft for review (S1 Design) · 2026-10-21 · Arvind
+**Supersedes:** v1.2 (commit `0b629ed`), v1.1 (commit `c096573`) and v1.0 (commit `49b8aa1`), same file. Change summary in §0.
 
 ---
 
 ## 0. Change log
+
+### Changes in v1.3 (third review: financial and lifecycle consistency)
+
+| Finding | Change | Where |
+| --- | --- | --- |
+| 1. Supplier-driver COD not demonstrated | Example 2b: supplier's driver keeps cash against the payable; netting entries share a settlement id and must be equal; only real cash is a handover | §10.2, §10.3 |
+| 2. Reversal vs refund, late payment, failed refund | Explicit customer-account invariants (reversal ≠ refund; bounds on reversals and refunds); Example 6: late payment after expiry with a failed then completed refund; Expired orders are never revived | §9.1, §10.2, §10.3 |
+| (found while fixing 2) Abandoned prepaid checkouts left a positive balance | Prepaid charges are now written on transition to Placed, not at Payment pending; COD charges at placement | §8, §10.2 |
+| 3. Replacement vs quantity constraint | Original and replacement quantities counted separately with their own DB checks; replacement linked to its ReturnRequest; no customer charge for a replacement unless an explicit ADJUSTMENT; Example 7 | §2 I-4, §5, §9.3a, §9.5, §10.3 |
+| 4. Invoice check narrower than ledger | Two separate checks: tax-document reconciliation (all invoiced components) and customer-account reconciliation | §10.4 |
+| 5. Close guard and replacements | Return with replacement resolution stays open until the replacement is delivered or converted to a refund; guard condition added | §9.1, §9.5 |
 
 ### Changes in v1.2 (second independent review)
 
@@ -104,7 +115,7 @@ Proposals to lift into `DOCTRINE.md` §2. Each names how it is enforced, so a vi
 | **I-1** | Supplier identity and commercial data (supplier name, GSTIN, address, offers, costs) never appear on any customer-facing surface. The only fulfilment data a customer sees is the **delivery contact** needed to receive the order: delivery person's name, phone, vehicle number and ETA — never the supplier's business name, even when the supplier's own driver delivers. | Storefront API returns customer DTOs that have no supplier fields; `catalog`/`checkout` cannot import `fulfilment` (lint rule); delivery contact comes from `DeliveryExecutor` only; notification templates have no supplier variables; contract test asserts storefront responses and notifications contain no supplier data. Physical paperwork from suppliers is governed by supplier terms (D17). |
 | **I-2** | Goods price, supplier cost, platform fees, delivery charge and delivery cost are separate financial components with separate owners. | Separate columns and ledger entry types; operator role cannot read cost or margin fields (API-level authorisation, not just hidden UI). |
 | **I-3** | A placed order's snapshot and any issued financial document are immutable. What happened afterwards is recorded in operational records; what it costs is recorded in financial records (§10.1). Corrections are always new records. | Money and snapshot columns are write-once (DB trigger rejects updates after placement); invoices and credit notes are insert-only; changes go through charge reversals, adjustments, credit notes or refunds. |
-| **I-4** | Each order line has at most one active fulfilment assignment; a shipment line always references the assignment it fulfils, and a shipment's source never changes; every state change goes through the entity's transition function and is logged with actor, timestamp, reason code and note. | Partial unique index `(order_line_id) WHERE active`; FK from shipment line to assignment plus check that the assignment's source equals the shipment's source; quantity check: Σ quantity in non-cancelled shipment lines for an order line ≤ qty_ordered − qty_cancelled; transition functions run in one DB transaction with the event insert; direct status updates blocked by DB role permissions; event table is insert-only. |
+| **I-4** | Each order line has at most one active fulfilment assignment; a shipment line always references the assignment it fulfils, and a shipment's source never changes; every state change goes through the entity's transition function and is logged with actor, timestamp, reason code and note. | Partial unique index `(order_line_id) WHERE active`; FK from shipment line to assignment plus check that the assignment's source equals the shipment's source; quantity checks per purpose: Σ planned qty in non-cancelled **original** shipment lines for an order line ≤ qty_ordered − qty_cancelled; Σ planned qty in non-cancelled **replacement** shipment lines for a ReturnRequest ≤ that return's approved replacement qty; transition functions run in one DB transaction with the event insert; direct status updates blocked by DB role permissions; event table is insert-only. |
 | **I-5** | Money is integer paise; quantities are integers in the product's selling unit. | `bigint` paise columns; `integer` quantities with a check constraint `> 0`; no fractional quantities in v1. |
 | **I-6** | Business rules are versioned configuration; an order records the exact rule versions and computed amounts it used. | Published rule versions are immutable; edits create a new version with `effective_from`; order stores rule version ids plus computed values. |
 | **I-7** | No live transaction or tax invoice without a verified business configuration. | Placement in live mode and invoice issuance both check `BusinessProfile.status = VERIFIED` and `system_mode = LIVE`; test mode allows dummy data, uses gateway test keys only, and watermarks documents "TEST — not a tax invoice". |
@@ -352,13 +363,13 @@ flowchart LR
 | Offer | supplier, product, current cost (via cost rule), lead_time_hours, available, last_confirmed_at | fulfilment | Orderable only if confirmed within freshness window |
 | Customer / Address | phone, name; lines, landmark, pincode, optional lat/lng | identity | Address pincode must map to an active zone |
 | Order | number, customer, address snapshot, slot, quote snapshot (components + rule version ids), payment_method, status, idempotency_key, placed_at | orders | Snapshot write-once (I-3) |
-| OrderLine | order, product, product snapshot (name, unit, hsn, gst_rate), unit_price_paise, qty_ordered, qty_delivered, qty_damaged, qty_returned, qty_cancelled, tax snapshot | orders | Quantities reconcile: qty_ordered = delivered (net of damaged/refused) + cancelled + still open; returned ≤ delivered |
-| FulfilmentAssignment | order_line, qty, purpose (ORIGINAL / REPLACEMENT), source_type, supplier, offer, cost snapshot, state, confirm_deadline, assigned_by/at, active, superseded_by | fulfilment | One active per line (I-4); inactive once Completed, Rejected, Timed out or Failed |
+| OrderLine | order, product, product snapshot (name, unit, hsn, gst_rate), unit_price_paise, qty_ordered, qty_delivered, qty_damaged, qty_returned, qty_cancelled, tax snapshot | orders | Original quantities reconcile: qty_ordered = delivered (net of damaged/refused) + cancelled + still open; returned ≤ delivered. Replacement quantities are tracked on the ReturnRequest, not added to qty_ordered |
+| FulfilmentAssignment | order_line, qty, purpose (ORIGINAL / REPLACEMENT), return_request (required iff REPLACEMENT), source_type, supplier, offer, cost snapshot, state, confirm_deadline, assigned_by/at, active, superseded_by | fulfilment | One active per line (I-4); inactive once Completed, Rejected, Timed out or Failed |
 | Shipment | order, source (supplier or own stock), slot, state, executor, ETA, delivery OTP hash, POD refs, delivery cost, supersedes | delivery | One source to one address on one slot; source never edited |
-| ShipmentLine | shipment, order_line, assignment, qty planned, qty delivered, qty damaged, qty refused | delivery | Assignment source must equal shipment source (I-4) |
+| ShipmentLine | shipment, order_line, assignment, purpose (copied from assignment), qty planned, qty delivered, qty damaged, qty refused | delivery | Assignment source must equal shipment source; quantity checks per purpose (I-4) |
 | DeliveryExecutor | type (SUPPLIER / OWN / THIRD_PARTY), name, phone, vehicle no, external ref | delivery | Entered manually in MVP |
 | DeliveryAttempt | shipment, attempt no, outcome, reason code, notes, evidence, at, actor | delivery | One per attempt |
-| ReturnRequest | order line(s), type, qty, reason code, evidence, state, resolution (refund / replacement), pickup shipment | returns | |
+| ReturnRequest | order line, type, qty returned, reason code, evidence, state, resolution (REFUND / REPLACEMENT), replacement qty approved, replacement qty delivered, pickup shipment | returns | One line per request in v1; replacement qty ≤ qty returned |
 | Payment | order, method, gateway ref, gateway event ids, amount, state | finance | |
 | Refund | order, amount, method, reason code, state, approved_by, gateway ref | finance | |
 | Invoice / CreditNote | number, order, lines with taxable value and tax, totals, issued_at, PDF ref | finance | Insert-only; test series in test mode |
@@ -426,7 +437,7 @@ A mobile-first web app; landing to placed order in under 2 minutes; login only a
 6. Optionally adds GSTIN and business name for a B2B invoice (customer GSTIN, separate from business and supplier GSTINs).
 7. Chooses UPI/card or COD (if allowed by COD policy, D5).
 8. Server re-quotes; if anything changed, shows the difference and asks for re-confirmation.
-9. Placement runs in one transaction with an idempotency key: order, lines, quote snapshot and ledger charge entries. Prepaid orders start in Payment pending; COD orders start in Placed.
+9. Placement runs in one transaction with an idempotency key: order, lines and quote snapshot. COD orders start in Placed and their ledger charges are written in the same transaction. Prepaid orders start in Payment pending with **no ledger entries**; their charges are written when the verified payment moves them to Placed, so abandoned checkouts never leave a balance.
 10. Prepaid: customer completes payment on the gateway; the order moves to Placed only on the verified webhook (I-9). Confirmation page polls status.
 
 **Customer-facing statuses**
@@ -463,15 +474,18 @@ All states change only through each entity's transition function, which checks t
 | Closed | Close guard passes (below) | Reopened (Owner only, with reason) |
 | Reopened | Owner records a post-closure issue (late claim, goodwill adjustment, dispute) | Closed when the close guard passes again |
 | Cancelled | All lines cancelled | Closed when the close guard passes (refunds completed) |
-| Expired | Payment pending timed out | — (late payment → auto-refund) |
+| Expired | Payment pending timed out; no ledger entries exist | Closed when the close guard passes. A late payment never revives it: it records the payment and triggers an automatic refund (Example 6) |
 
 **Close guard** (checked by the worker daily and on every relevant transition):
-1. Every shipment is terminal and every line's quantities reconcile (§5).
+1. Every shipment is terminal and every line's original quantities reconcile (§5).
 2. The return window (D10) has ended for every delivered line (§9.5).
-3. No ReturnRequest is in a non-terminal state.
-4. No Refund is Requested, Approved, Processing or **Failed** — a failed refund must be retried or completed by another method first.
-5. Ledger customer balance = 0 (§10.2).
-6. For invoiced lines: invoice total − credit-note total = net charges (§10.4).
+3. No ReturnRequest is in a non-terminal state — including any with resolution REPLACEMENT whose replacement shipment is not yet Delivered (§9.5).
+4. No replacement assignment is active and no replacement shipment is non-terminal.
+5. No Refund is Requested, Approved, Processing or **Failed** — a failed refund must be retried or completed by another method first.
+6. Customer-account reconciliation passes: ledger customer balance = 0 (§10.4, check 2).
+7. Tax-document reconciliation passes for invoiced components (§10.4, check 1).
+
+For an Expired order only conditions 5 and 6 apply.
 
 Supplier and delivery payables do **not** block closure; they are settled by period (§10.5).
 
@@ -505,7 +519,7 @@ Supplier and delivery payables do **not** block closure; they are settled by per
 | Supplier fails or withdraws after a shipment exists | Scheduled, Ready for dispatch, Delayed | Shipment → **Cancelled** (reason `SUPPLIER_FAILED`); assignment → Supplier failed (inactive); event logged on both. Owner creates a **new** assignment (`superseded_by` links old → new) and, once confirmed, a **new** shipment (`supersedes` links new → old). The old shipment and assignment are kept unchanged as history. |
 | Supplier problem discovered while Out for delivery | Out for delivery | Not a supplier-failure transition: recorded as a delivery attempt outcome or partial delivery (§9.4), then handled as short delivery or return. |
 | Reassignment requested on a line with a non-cancelled shipment | — | **Rejected.** The shipment must be cancelled first; a shipment is never moved to another source. |
-| Replacement after an approved return | — | New assignment with `purpose = REPLACEMENT` for the replacement qty (the original is already Completed, so I-4 holds), then a new shipment linked to the ReturnRequest. |
+| Replacement after an approved return | — | New assignment with `purpose = REPLACEMENT`, linked to the ReturnRequest, for the approved replacement qty (the original assignment is already Completed, so I-4 holds); then a new shipment whose lines carry `purpose = REPLACEMENT`. Replacement quantities are checked against the return, not against qty_ordered (I-4). **No customer charge** is written; a charge for a replacement exists only as an explicit Owner ADJUSTMENT (+) with reason. |
 | Failed attempt, same supplier redelivers | Attempt failed | Same shipment rescheduled; assignment unchanged. |
 
 ### 9.4 Shipment
@@ -544,7 +558,17 @@ stateDiagram-v2
 | Short delivery | Recorded at delivery | Refund for missing qty, or redelivery shipment |
 | Change of mind | Customer request | Only if allowed by policy (D10) |
 
-ReturnRequest states: Requested → Approved / Rejected → Pickup scheduled → Picked up → Received / Returned to supplier → Resolved. Replacement follows §9.3a. Supplier liability for damaged or incorrect goods depends on supplier terms (D17).
+ReturnRequest states: Requested → Approved / Rejected → Pickup scheduled → Picked up → Received / Returned to supplier → **Replacement pending** (resolution REPLACEMENT only) → Resolved. Terminal states: Rejected, Resolved. Supplier liability for damaged or incorrect goods depends on supplier terms (D17).
+
+**Resolution rules**
+
+| Resolution | Customer ledger | Supplier ledger | Becomes Resolved when |
+| --- | --- | --- | --- |
+| REFUND | CHARGE_REVERSAL for returned qty when goods are received; REFUND_PAID when the refund completes | SUPPLIER_CREDIT if supplier liable | Refund Completed |
+| REPLACEMENT | **None** — the customer keeps the value they paid for | SUPPLIER_CREDIT for the returned qty if supplier liable; new SUPPLIER_PAYABLE when the replacement is delivered | Replacement shipment Delivered for the approved qty (§9.3a) |
+| REPLACEMENT that fails (no source, cancelled, refused) | Converted to REFUND for the undelivered replacement qty: CHARGE_REVERSAL + refund | As above for anything delivered | Refund Completed |
+
+A conversion from replacement to refund is a logged transition with a reason code; the original resolution is kept in history.
 
 **Return window:**
 - Starts per order line at the timestamp its delivered quantity was recorded (the last delivering shipment for that line). Damage, short and incorrect-item claims made at the door are recorded on the shipment and need no return request.
@@ -600,18 +624,27 @@ Every entry belongs to one account of one counterparty and carries a signed amou
 
 | Account | Entry types (sign) | Created by |
 | --- | --- | --- |
-| **Customer** (per order) | GOODS_CHARGE (+), DELIVERY_CHARGE (+), PLATFORM_FEE (+) | Placement, from quote snapshot |
-| | CHARGE_REVERSAL (−) | Cancellation, short/damaged/refused at door, accepted return, waived charge |
+| **Customer** (per order) | GOODS_CHARGE (+), DELIVERY_CHARGE (+), PLATFORM_FEE (+) | From the quote snapshot: COD at placement; prepaid on transition to Placed (§8) |
+| | CHARGE_REVERSAL (−) | Cancellation, short/damaged/refused at door, return resolved as REFUND (goods received), waived charge |
 | | PAYMENT_RECEIVED (−) | Verified gateway event (I-9) |
 | | COD_COLLECTED (−) | Admin records collection at delivery |
 | | REFUND_PAID (+) | Refund reaches Completed only |
 | | WRITE_OFF (−) | Owner, with reason: amount owed that will not be collected |
 | | ADJUSTMENT (±) | Owner, with reason: goodwill credit (−) or extra charge (+) |
 | **Gateway** | GATEWAY_RECEIVABLE (+) on capture · GATEWAY_REFUND (−) · GATEWAY_FEE (−) · SETTLEMENT_RECEIVED (−) | Webhook, refund, settlement import |
-| **Executor** (per delivery person/partner) | COD_CUSTODY (+) when they collect cash · COD_HANDOVER (−) when they hand it over · DELIVERY_COST (−) · DELIVERY_PAID (+) | Admin actions |
-| **Supplier** | SUPPLIER_PAYABLE (−) on delivered qty × cost snapshot · SUPPLIER_CREDIT (+) for supplier-liable returns/damage (D17) · SUPPLIER_PAID (+) | Delivery recording, return resolution, payment recording |
+| **Executor** (per delivery person/partner) | COD_CUSTODY (+) when they collect cash · COD_HANDOVER (−) when real cash or a bank transfer reaches the business · COD_NETTED (−) when held cash is set off against a payable · DELIVERY_COST (−) · DELIVERY_PAID (+) | Admin actions |
+| **Supplier** | SUPPLIER_PAYABLE (−) on delivered qty × cost snapshot · SUPPLIER_CREDIT (+) for supplier-liable returns/damage (D17) · SUPPLIER_PAID (+) for a real payment · SUPPLIER_SETTLED_BY_NETTING (+) | Delivery recording, return resolution, payment recording, netting settlement |
 
-Customer balance is per order; gateway, executor and supplier balances are reported per counterparty and period. Netting COD cash held by a supplier's driver against that supplier's payable is an Owner settlement: COD_HANDOVER on the executor account and SUPPLIER_PAID on the supplier account for the netted amount.
+Customer balance is per order; gateway, executor and supplier balances are reported per counterparty and period.
+
+**Netting** (a supplier's driver keeps COD cash against what the business owes that supplier): an Owner-only **Settlement** record writes COD_NETTED on the executor account and SUPPLIER_SETTLED_BY_NETTING on the supplier account. Both entries carry the same settlement id and **must be equal in amount** (DB check on the settlement). Netting is allowed only when the executor is that supplier's own driver. Any cash actually handed over is a separate COD_HANDOVER. See Example 2b.
+
+**Customer-account invariants** (checked on every write, per order):
+1. **Balance:** B = Σ charges − Σ charge reversals − Σ payments received (gateway + COD) + Σ completed refunds − Σ write-offs ± Σ adjustments. This is simply the sum of the account's entries under the sign rule; B = 0 means settled.
+2. **A charge reversal and a refund are different events.** A reversal reduces what the customer is charged (they will not get, or keep, those goods); a refund returns money already paid. A partial delivery on a prepaid order needs both, and recording both is intentional, not a duplicate. A COD order reversed before collection needs a reversal and no refund.
+3. **Reversal bound:** for each charge component (goods per line, delivery charge, each platform fee), Σ reversals ≤ Σ charges.
+4. **Refund bounds:** a refund can be approved only up to the amount the business owes (−B, when B < 0) at approval, net of refunds already approved or processing; Σ completed refunds ≤ Σ payments received.
+5. **No silent cash:** COD_COLLECTED on the customer account is always written together with an equal COD_CUSTODY on the executor account.
 
 ### 10.3 Worked examples
 
@@ -621,9 +654,10 @@ Base order for all examples: 10 bags of cement at ₹400 each (GST-inclusive) = 
 
 | Step | Account | Entry | Amount | Customer balance |
 | --- | --- | --- | --- | --- |
-| Placement | Customer | GOODS_CHARGE | +4,000 | 4,000 |
+| Placement (Payment pending) | — | none | — | 0 |
+| Verified payment → Placed | Customer | GOODS_CHARGE | +4,000 | 4,000 |
 | | Customer | DELIVERY_CHARGE | +300 | 4,300 |
-| Verified payment | Customer | PAYMENT_RECEIVED | −4,300 | 0 |
+| | Customer | PAYMENT_RECEIVED | −4,300 | 0 |
 | | Gateway | GATEWAY_RECEIVABLE | +4,300 | |
 | Delivered 10 | Supplier | SUPPLIER_PAYABLE | −3,600 | |
 | Settlement | Gateway | GATEWAY_FEE | −86 | |
@@ -639,7 +673,21 @@ Base order for all examples: 10 bags of cement at ₹400 each (GST-inclusive) = 
 | | Executor | COD_CUSTODY | +4,300 | (driver holds cash) |
 | | Supplier | SUPPLIER_PAYABLE | −3,600 | |
 | Cash handed over | Executor | COD_HANDOVER | −4,300 | (executor balance 0) |
+| Supplier paid by bank | Supplier | SUPPLIER_PAID | +3,600 | (supplier balance 0) |
 | Close | Customer balance 0 → **Closed**. | | | |
+
+**Example 2b — COD, supplier's driver keeps cash against the payable (netting)**
+
+| Step | Account | Entry | Amount | Balances after step |
+| --- | --- | --- | --- | --- |
+| Placement | Customer | charges | +4,300 | Customer 4,300 |
+| Delivered 10, supplier's driver collects | Customer | COD_COLLECTED | −4,300 | Customer 0 |
+| | Executor (supplier's driver) | COD_CUSTODY | +4,300 | Executor 4,300 |
+| | Supplier | SUPPLIER_PAYABLE | −3,600 | Supplier −3,600 |
+| Netting settlement S-1 (Owner) | Executor | COD_NETTED | −3,600 | Executor 700 |
+| | Supplier | SUPPLIER_SETTLED_BY_NETTING | +3,600 | Supplier 0 |
+| Supplier transfers the remainder | Executor | COD_HANDOVER | −700 | Executor 0 |
+| Close | Customer 0, executor 0, supplier 0; real cash received by the business = ₹700, matching the bank statement. Delivery cost is ₹0 here because delivery is included in the supplier's cost; if charged separately it is a DELIVERY_COST (−) on the executor account. | | | |
 
 **Example 3 — Prepaid, partial delivery (2 bags damaged, refused at the door)**
 
@@ -655,7 +703,7 @@ Base order for all examples: 10 bags of cement at ₹400 each (GST-inclusive) = 
 
 Delivery charge is not reversed for a partial delivery in this example; that is a policy choice (D10). COD variant: after the reversal the balance is 3,500; COD_COLLECTED −3,500 brings it to 0 and no refund is needed.
 
-**Example 4 — Prepaid, return after delivery (1 incorrect bag, within window, supplier liable)**
+**Example 4 — Prepaid, return after delivery (1 incorrect bag, within window, supplier liable, resolution REFUND)**
 
 | Step | Account | Entry | Amount | Customer balance |
 | --- | --- | --- | --- | --- |
@@ -678,7 +726,32 @@ Delivery charge is not reversed for a partial delivery in this example; that is 
 | | Executor | DELIVERY_COST if return trip is charged (D17) | as agreed | |
 | Close | Balance 0 → **Closed**; customer flagged per COD refusal policy (D5). | | | |
 
-These five examples become automated tests in S10: each must produce exactly these balances.
+**Example 6 — Prepaid, payment arrives after expiry; first refund attempt fails**
+
+| Step | Account | Entry | Amount | Customer balance |
+| --- | --- | --- | --- | --- |
+| Placement (Payment pending) | — | none | — | 0 |
+| 30 min, no payment → **Expired** | — | none (no charges were ever written) | — | 0 |
+| Late verified capture at 40 min | Customer | PAYMENT_RECEIVED | −4,300 | −4,300 (we owe customer) |
+| | Gateway | GATEWAY_RECEIVABLE | +4,300 | |
+| Automatic refund requested and approved (system actor) | — | none (status only) | — | −4,300 |
+| Refund attempt fails at gateway | — | none; Refund → **Failed**; ops queue alert | — | −4,300 |
+| Retry → Completed | Customer | REFUND_PAID | +4,300 | 0 |
+| | Gateway | GATEWAY_REFUND | −4,300 | |
+| Close | Order stays **Expired** throughout and is never revived or fulfilled. Expired close guard (refund resolved, balance 0) passes → **Closed**. | | | |
+
+**Example 7 — Prepaid, return resolved by REPLACEMENT (1 incorrect bag, supplier liable)**
+
+| Step | Account | Entry | Amount | Balances after step |
+| --- | --- | --- | --- | --- |
+| After Example 1 delivery | — | — | — | Customer 0, supplier −3,600 |
+| Return approved (REPLACEMENT, qty 1); bag picked up and received | Supplier | SUPPLIER_CREDIT | +360 | Supplier −3,240 |
+| | Customer | none — no reversal, no refund | — | Customer 0 |
+| Replacement assignment (purpose REPLACEMENT, linked to return) confirmed; replacement shipment delivered 1 | Supplier | SUPPLIER_PAYABLE | −360 | Supplier −3,600 |
+| Return → Resolved | — | — | — | Customer 0 |
+| Close | Replacement delivered, return resolved, window ended, balance 0 → **Closed**. Original line quantities: ordered 10, delivered 10, returned 1; replacement 1 approved, 1 delivered — counted on the return, not on qty_ordered. If the replacement had failed, it converts to REFUND: CHARGE_REVERSAL −400, then REFUND_PAID +400. | | | |
+
+These examples (1, 2, 2b, 3, 4, 5, 6, 7) become automated tests in S10: each must produce exactly these balances.
 
 ### 10.4 Invoices and credit notes
 
@@ -692,9 +765,18 @@ The invoice policy is a **required live-mode setting** (§4.1, checklist L4). Th
 
 Common rules for every policy:
 - Delivery charge and platform fees are invoiced with the order's first invoice; their tax treatment is D13.
-- A credit note is issued in the same transaction as the CHARGE_REVERSAL for already-invoiced quantities; never for quantities not yet invoiced.
-- Reconciliation check per order: **Σ invoices − Σ credit notes = Σ charges − Σ charge reversals for invoiced lines**. Part of the close guard (§9.1).
+- A credit note is issued in the same transaction as the CHARGE_REVERSAL for already-invoiced amounts; never for amounts not yet invoiced.
+- Replacement shipments carry no charge and produce no tax invoice; the document that travels with replacement goods is part of D13.
 - In test mode every policy can be exercised; documents are watermarked and use a test series.
+
+**Two separate reconciliation checks** (both in the close guard, §9.1):
+
+| Check | Question it answers | Equation (per order) | Covers |
+| --- | --- | --- | --- |
+| 1. Tax documents | Do issued tax documents match what was charged? | Σ invoice totals − Σ credit-note totals = Σ invoiced charges − Σ reversals of invoiced charges | Every invoiced component: goods per line, delivery charge, platform fees, with their tax |
+| 2. Customer account | Is the customer fully settled? | B = Σ charges − Σ reversals − Σ payments received + Σ completed refunds − Σ write-offs ± Σ adjustments = 0 (§10.2) | Everything, including payments, refunds, write-offs, adjustments and un-invoiced charges |
+
+Check 1 can pass while check 2 fails (e.g. invoices and credit notes correct, but a refund failed), and check 2 can pass while check 1 fails (e.g. a charge was reversed and refunded but its credit note was never issued). Adjustments and write-offs that change a taxable amount need a matching tax document; whether a given adjustment does is part of D13.
 
 ### 10.5 Reconciliation views (MVP, manual)
 
