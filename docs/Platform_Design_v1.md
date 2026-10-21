@@ -1,11 +1,20 @@
 # Platform Design v1 — MVP Spec
 
-**Status:** v1.3 draft for review (S1 Design) · 2026-10-21 · Arvind
-**Supersedes:** v1.2 (commit `0b629ed`), v1.1 (commit `c096573`) and v1.0 (commit `49b8aa1`), same file. Change summary in §0.
+**Status:** v1.3.1 — accepted by owner with two clarifications (S1 Design) · 2026-10-21 · Arvind
+**Supersedes:** v1.3 (commit `20a2132`), v1.2 (commit `0b629ed`), v1.1 (commit `c096573`) and v1.0 (commit `49b8aa1`), same file. Change summary in §0.
 
 ---
 
 ## 0. Change log
+
+### Changes in v1.3.1 (owner clarifications)
+
+| Clarification | Change | Where |
+| --- | --- | --- |
+| Replacement failure must not duplicate a reversal | Conversion reverses only the unreversed part (`qty_charge_already_reversed`); unique source ref on system reversals; conversion idempotent; ledger never edited | §5, §9.5, §10.2 inv. 3a |
+| (needed for the above) Replacement after a door-level reversal gave goods free | Charge reinstatement on replacement delivery when the charge was already reversed; pending replacement value excluded from the owed limit | §9.5, §10.2 inv. 4a, §10.4 |
+| Two separate refund limits | 4a owed limit and 4b paid limit, both net of completed refunds and pending commitments (Failed counts as pending) | §10.2 inv. 4 |
+| S10 coverage | Tests T1–T7 | §10.6, §15 |
 
 ### Changes in v1.3 (third review: financial and lifecycle consistency)
 
@@ -369,7 +378,7 @@ flowchart LR
 | ShipmentLine | shipment, order_line, assignment, purpose (copied from assignment), qty planned, qty delivered, qty damaged, qty refused | delivery | Assignment source must equal shipment source; quantity checks per purpose (I-4) |
 | DeliveryExecutor | type (SUPPLIER / OWN / THIRD_PARTY), name, phone, vehicle no, external ref | delivery | Entered manually in MVP |
 | DeliveryAttempt | shipment, attempt no, outcome, reason code, notes, evidence, at, actor | delivery | One per attempt |
-| ReturnRequest | order line, type, qty returned, reason code, evidence, state, resolution (REFUND / REPLACEMENT), replacement qty approved, replacement qty delivered, pickup shipment | returns | One line per request in v1; replacement qty ≤ qty returned |
+| ReturnRequest | order line, type, qty returned, qty_charge_already_reversed, reason code, evidence, state, resolution (REFUND / REPLACEMENT), replacement qty approved, replacement qty delivered, pickup shipment | returns | One line per request in v1; replacement qty ≤ qty returned; qty_charge_already_reversed set when the return comes from a door-level record whose reversal exists |
 | Payment | order, method, gateway ref, gateway event ids, amount, state | finance | |
 | Refund | order, amount, method, reason code, state, approved_by, gateway ref | finance | |
 | Invoice / CreditNote | number, order, lines with taxable value and tax, totals, issued_at, PDF ref | finance | Insert-only; test series in test mode |
@@ -565,10 +574,10 @@ ReturnRequest states: Requested → Approved / Rejected → Pickup scheduled →
 | Resolution | Customer ledger | Supplier ledger | Becomes Resolved when |
 | --- | --- | --- | --- |
 | REFUND | CHARGE_REVERSAL for returned qty when goods are received; REFUND_PAID when the refund completes | SUPPLIER_CREDIT if supplier liable | Refund Completed |
-| REPLACEMENT | **None** — the customer keeps the value they paid for | SUPPLIER_CREDIT for the returned qty if supplier liable; new SUPPLIER_PAYABLE when the replacement is delivered | Replacement shipment Delivered for the approved qty (§9.3a) |
-| REPLACEMENT that fails (no source, cancelled, refused) | Converted to REFUND for the undelivered replacement qty: CHARGE_REVERSAL + refund | As above for anything delivered | Refund Completed |
+| REPLACEMENT | **None** — the customer keeps the value they paid for. Exception: if the returned qty's goods charge was already reversed (a door-level damaged/short record, tracked as `qty_charge_already_reversed`), a **charge reinstatement** GOODS_CHARGE (+) for that qty, source ref = ReturnRequest, is written when the replacement is delivered, so the customer pays once for goods received once | SUPPLIER_CREDIT for the returned qty if supplier liable; new SUPPLIER_PAYABLE when the replacement is delivered | Replacement shipment Delivered for the approved qty (§9.3a) |
+| REPLACEMENT that fails (no source, cancelled, refused) | Converted to REFUND for the undelivered replacement qty: CHARGE_REVERSAL **only for the part of that line's goods charge still unreversed** (§10.2 invariant 3a), then a refund within both refund limits (invariant 4) | As above for anything delivered | Refund Completed |
 
-A conversion from replacement to refund is a logged transition with a reason code; the original resolution is kept in history.
+A conversion from replacement to refund is a logged transition with a reason code; the original resolution is kept in history. The conversion is **idempotent**: it runs once per ReturnRequest under an idempotency key (`return_request_id` + `CONVERT_TO_REFUND`); replaying it writes no further ledger entries and creates no further refund. Existing ledger entries are never edited or deleted — if the charge was already reversed by an earlier event, the conversion simply writes no reversal.
 
 **Return window:**
 - Starts per order line at the timestamp its delivered quantity was recorded (the last delivering shipment for that line). Damage, short and incorrect-item claims made at the door are recorded on the shipment and need no return request.
@@ -643,7 +652,12 @@ Customer balance is per order; gateway, executor and supplier balances are repor
 1. **Balance:** B = Σ charges − Σ charge reversals − Σ payments received (gateway + COD) + Σ completed refunds − Σ write-offs ± Σ adjustments. This is simply the sum of the account's entries under the sign rule; B = 0 means settled.
 2. **A charge reversal and a refund are different events.** A reversal reduces what the customer is charged (they will not get, or keep, those goods); a refund returns money already paid. A partial delivery on a prepaid order needs both, and recording both is intentional, not a duplicate. A COD order reversed before collection needs a reversal and no refund.
 3. **Reversal bound:** for each charge component (goods per line, delivery charge, each platform fee), Σ reversals ≤ Σ charges.
-4. **Refund bounds:** a refund can be approved only up to the amount the business owes (−B, when B < 0) at approval, net of refunds already approved or processing; Σ completed refunds ≤ Σ payments received.
+3a. **No duplicate reversal:** every system-generated CHARGE_REVERSAL carries a source reference (event type + source record id, e.g. shipment line, line cancellation, ReturnRequest conversion), with a unique constraint on that reference. Its amount is min(amount the event would reverse, unreversed remainder of that charge component). For a replacement-to-refund conversion, the amount the event would reverse = (undelivered replacement qty − qty_charge_already_reversed, floored at 0) × unit price, so a charge already reversed at the door is never reversed again. If the result is 0, no reversal is written; the refund still proceeds within invariant 4.
+4. **Refund limits** — checked when a refund is requested and again when approved, inside one transaction holding a lock on the order. A refund amount must not exceed **either** limit:
+    - **4a. Owed limit:** amount ≤ max(0, −B) − Σ pending refund commitments − Σ pending replacement value. (B already includes completed refunds. Pending replacement value = value of replacement qty whose charge was already reversed and whose replacement is not yet delivered or failed — that credit will be consumed by the reinstatement, so it is not refundable.)
+    - **4b. Paid limit:** amount ≤ Σ payments received (gateway + COD) − Σ completed refunds − Σ pending refund commitments.
+
+    **Pending refund commitments** = refunds in Requested, Approved, Processing or Failed (a Failed refund still holds its commitment until it is completed or cancelled). A request breaching either limit is rejected with the limit that failed; nothing is written.
 5. **No silent cash:** COD_COLLECTED on the customer account is always written together with an equal COD_CUSTODY on the executor account.
 
 ### 10.3 Worked examples
@@ -751,7 +765,7 @@ Delivery charge is not reversed for a partial delivery in this example; that is 
 | Return → Resolved | — | — | — | Customer 0 |
 | Close | Replacement delivered, return resolved, window ended, balance 0 → **Closed**. Original line quantities: ordered 10, delivered 10, returned 1; replacement 1 approved, 1 delivered — counted on the return, not on qty_ordered. If the replacement had failed, it converts to REFUND: CHARGE_REVERSAL −400, then REFUND_PAID +400. | | | |
 
-These examples (1, 2, 2b, 3, 4, 5, 6, 7) become automated tests in S10: each must produce exactly these balances.
+These examples (1, 2, 2b, 3, 4, 5, 6, 7) become automated tests in S10: each must produce exactly these balances. Additional S10 tests are in §10.6.
 
 ### 10.4 Invoices and credit notes
 
@@ -766,7 +780,7 @@ The invoice policy is a **required live-mode setting** (§4.1, checklist L4). Th
 Common rules for every policy:
 - Delivery charge and platform fees are invoiced with the order's first invoice; their tax treatment is D13.
 - A credit note is issued in the same transaction as the CHARGE_REVERSAL for already-invoiced amounts; never for amounts not yet invoiced.
-- Replacement shipments carry no charge and produce no tax invoice; the document that travels with replacement goods is part of D13.
+- Replacement shipments carry no charge and produce no tax invoice; the document that travels with replacement goods is part of D13. A charge reinstatement (§9.5) is invoiced under the active policy like any other charge; D13 confirms the treatment.
 - In test mode every policy can be exercised; documents are watermarked and use a test series.
 
 **Two separate reconciliation checks** (both in the close guard, §9.1):
@@ -786,6 +800,22 @@ Check 1 can pass while check 2 fails (e.g. invoices and credit notes correct, bu
 - **Supplier payables:** supplier account balances per period, with delivered quantities and credits.
 - **Orders not closable:** failing close-guard conditions, per order.
 - **Invoice check:** orders where invoices − credit notes ≠ net invoiced charges.
+
+### 10.6 S10 test scenarios: reversal idempotency and refund limits
+
+In addition to the §10.3 examples. Base order as in §10.3 (10 bags × ₹400, delivery ₹300, total ₹4,300). Each test asserts the ledger entries written, the refund decision and the final customer balance B.
+
+| Test | Setup | Action | Expected |
+| --- | --- | --- | --- |
+| T1 — Replacement fails; charge already reversed at the door | Prepaid, paid ₹4,300. 1 bag refused damaged at door → CHARGE_REVERSAL −400 (ref: shipment line). Return opened from that record with resolution REPLACEMENT, qty 1, `qty_charge_already_reversed = 1`. B = −400 | (a) While replacement pending, request refund ₹400. (b) Replacement fails → conversion to REFUND. (c) Request refund ₹400 and complete it | (a) **Rejected, 4a** (owed limit 0: the ₹400 credit is held for the replacement). (b) **No CHARGE_REVERSAL written** (1 − 1 = 0). (c) Accepted; REFUND_PAID +400; B = 0 |
+| T2 — Same, replacement succeeds | As T1 | Replacement delivered | Charge reinstatement GOODS_CHARGE +400 (ref: ReturnRequest); no refund; B = 0 |
+| T3 — Conversion replayed | Example 7 state; replacement fails (charge not previously reversed) | Run conversion; replay the same conversion; request refund ₹400 twice | First run writes CHARGE_REVERSAL −400; **replay writes nothing** (unique source ref). First refund accepted and completed; **second rejected, 4a**. B = 0 |
+| T4 — Owed limit, including pending commitments | Example 3 state: B = −800 after door reversal | Request ₹900; request ₹800; then request ₹100 while the ₹800 is pending | ₹900 **rejected, 4a** (limit 800). ₹800 accepted. ₹100 **rejected, 4a** (limit 0 because ₹800 is pending) |
+| T5 — Paid limit binds while owed limit does not | COD, customer refused, nothing collected: charges +4,300, CHARGE_REVERSAL −4,300; Owner goodwill ADJUSTMENT −200. B = −200, paid = 0 | Request refund ₹200 | **Rejected, 4b** (paid limit 0). The ₹200 credit cannot be refunded as money; the Owner resolves it with an offsetting ADJUSTMENT, with reason |
+| T6 — Failed refund still holds its commitment | Example 3 state; ₹800 refund requested, then Failed | Request a new ₹800 refund; then retry the failed one | New request **rejected, 4a** (limit 0). Retry completes; REFUND_PAID +800; B = 0 |
+| T7 — Concurrency | Example 3 state | Two ₹800 refund requests submitted simultaneously | Exactly one accepted (order lock); the other **rejected, 4a** |
+
+These scenarios were checked against a minimal model of the rules during design; that is a check of the specification's arithmetic, not evidence about the implementation. The S10 tests against the real code are what count.
 
 Supplier payouts themselves are made outside the system in v1 and recorded as settled.
 
@@ -890,7 +920,7 @@ Twelve sessions, each one PR with one scope. Risk tier per the operating model: 
 | S7 | Implementation | Payments: gateway, verified idempotent webhooks, expiry, late-payment refunds, COD | High |
 | S8 | Implementation | Admin orders, suppliers/offers, assignment with deadlines and timeouts | High |
 | S9 | Implementation | Shipments, executors, attempts, OTP/proof delivery, rescheduling | High |
-| S10 | Implementation | Returns, pickups, refunds, invoices and credit notes under all three invoice policies, ledger accounts, reconciliation views; §10.3 examples as automated tests | High |
+| S10 | Implementation | Returns, pickups, refunds, invoices and credit notes under all three invoice policies, ledger accounts, reconciliation views; §10.3 examples and §10.6 tests T1–T7 as automated tests | High |
 | S11 | Implementation | Notifications via worker, templates, admin rules/settings screens polish | Medium |
 | S12 | Investigation | Load test per §3.7, restore test, end-to-end test orders with real suppliers in test mode, go-live checklist L1–L10 | Medium |
 
