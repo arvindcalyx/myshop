@@ -1,11 +1,17 @@
 # Platform Design v1 — MVP Spec
 
-**Status:** v1.3.1 — accepted by owner with two clarifications (S1 Design) · 2026-10-21 · Arvind
-**Supersedes:** v1.3 (commit `20a2132`), v1.2 (commit `0b629ed`), v1.1 (commit `c096573`) and v1.0 (commit `49b8aa1`), same file. Change summary in §0.
+**Status:** v1.3.2 — accepted by owner; I-7 wording aligned with `DOCTRINE.md` (S1 Design) · 2026-10-21 · Arvind
+**Supersedes:** v1.3.1 (commit `0d45232`), v1.3 (commit `20a2132`), v1.2 (commit `0b629ed`), v1.1 (commit `c096573`) and v1.0 (commit `49b8aa1`), same file. Change summary in §0.
 
 ---
 
 ## 0. Change log
+
+### Changes in v1.3.2 (wording only)
+
+| Change | Where |
+| --- | --- |
+| I-7 split: live transactions need verified business configuration; live tax invoices need that **and** an approved invoice policy; test-mode documents are never tax invoices. Same wording in `DOCTRINE.md` and `CONSTRAINTS_CARD.md`. No behaviour change. | §2 I-7, candidate refusals |
 
 ### Changes in v1.3.1 (owner clarifications)
 
@@ -127,11 +133,11 @@ Proposals to lift into `DOCTRINE.md` §2. Each names how it is enforced, so a vi
 | **I-4** | Each order line has at most one active fulfilment assignment; a shipment line always references the assignment it fulfils, and a shipment's source never changes; every state change goes through the entity's transition function and is logged with actor, timestamp, reason code and note. | Partial unique index `(order_line_id) WHERE active`; FK from shipment line to assignment plus check that the assignment's source equals the shipment's source; quantity checks per purpose: Σ planned qty in non-cancelled **original** shipment lines for an order line ≤ qty_ordered − qty_cancelled; Σ planned qty in non-cancelled **replacement** shipment lines for a ReturnRequest ≤ that return's approved replacement qty; transition functions run in one DB transaction with the event insert; direct status updates blocked by DB role permissions; event table is insert-only. |
 | **I-5** | Money is integer paise; quantities are integers in the product's selling unit. | `bigint` paise columns; `integer` quantities with a check constraint `> 0`; no fractional quantities in v1. |
 | **I-6** | Business rules are versioned configuration; an order records the exact rule versions and computed amounts it used. | Published rule versions are immutable; edits create a new version with `effective_from`; order stores rule version ids plus computed values. |
-| **I-7** | No live transaction or tax invoice without a verified business configuration. | Placement in live mode and invoice issuance both check `BusinessProfile.status = VERIFIED` and `system_mode = LIVE`; test mode allows dummy data, uses gateway test keys only, and watermarks documents "TEST — not a tax invoice". |
+| **I-7** | Live transactions require a verified business configuration. Live tax-invoice issuance requires a verified business configuration **and** an approved invoice policy; invoice-policy approval never substitutes for business verification. Test-mode documents are never tax invoices. | Live placement checks `system_mode = LIVE` and `BusinessProfile.status = VERIFIED`. Live invoice issuance checks the same **plus** an approved invoice policy (checklist L4 verified). Test mode allows dummy data and gateway test keys only; its documents use a test series, are watermarked "TEST — not a tax invoice", and are never issued as or converted into tax invoices. |
 | **I-8** | Every money movement is an append-only ledger entry; the ledger customer account is the authoritative customer balance; an order closes only when that balance is zero and no return or refund is unresolved. | `LedgerEntry` insert-only; one accounting equation (§10.2); close transition guard (§9.1). A refund request or approval creates no ledger entry — only a completed refund does. |
 | **I-9** | Payment status changes only from a verified, idempotent gateway event or a recorded COD collection — never from a browser redirect. | Webhook signature verification; unique constraint on gateway event id; COD collection is an admin action with actor and executor recorded. |
 
-**Candidate refusals:** no supplier-facing surfaces in v1; no automated price changes; no orders outside serviced zones; no live orders without verified business configuration; no live tax invoice without an approved invoice policy; no "delivered" without OTP or recorded proof.
+**Candidate refusals:** no supplier-facing surfaces in v1; no automated price changes; no orders outside serviced zones; no live orders without verified business configuration; no live tax invoice without both verified business configuration and an approved invoice policy; no test-mode document treated as a tax invoice; no "delivered" without OTP or recorded proof.
 
 ---
 

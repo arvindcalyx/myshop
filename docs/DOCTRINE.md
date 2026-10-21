@@ -17,7 +17,9 @@
   - show supplier identity or commercial data to customers;
   - change prices automatically;
   - accept orders outside serviced zones;
-  - take live orders or issue live tax invoices without verified business configuration and an approved invoice policy;
+  - take live orders without a verified business configuration;
+  - issue live tax invoices without both a verified business configuration and an approved invoice policy;
+  - treat any test-mode document as a tax invoice;
   - mark goods delivered without a delivery OTP or recorded proof with an Owner override;
   - move money, or record money as moved, outside the ledger;
   - treat a design document, review or test-mode run as proof of compliance.
@@ -32,7 +34,7 @@
 | **I-4** | An order line has at most one active fulfilment assignment; a shipment line always references its assignment; a shipment's source never changes; every state change goes through a transition function and is logged with actor, time and reason. |
 | **I-5** | Money is integer paise; quantities are positive integers in the product's selling unit. |
 | **I-6** | Business rules are versioned configuration; an order records the rule versions and amounts it used. |
-| **I-7** | No live transaction and no live tax invoice without a verified business configuration and an approved invoice policy. |
+| **I-7** | Live transactions require a verified business configuration. Live tax-invoice issuance requires a verified business configuration **and** an approved invoice policy; invoice-policy approval never substitutes for business verification. Test-mode documents are never tax invoices. |
 | **I-8** | Every money movement is an append-only ledger entry; the ledger customer account is the authoritative balance; an order closes only when it is zero and no return, replacement or refund is unresolved. |
 | **I-9** | Payment status changes only from a verified, idempotent gateway event or a recorded COD collection. |
 
@@ -47,7 +49,7 @@ Module names refer to the planned modules in `Platform_Design_v1.md` §3.5. No c
 | **C3** | State changes only through each entity's transition function, in one transaction with its event record; no direct status writes. (I-4) | `orders`, `fulfilment`, `delivery`, `returns`, `finance`; DB role permissions |
 | **C4** | Order snapshots, invoices and credit notes are write-once; corrections are reversals, adjustments, credit notes or refunds. (I-3) | DB triggers; `finance` |
 | **C5** | No business value is hardcoded: prices, costs, fees, thresholds, zones, slots and timers live in versioned config. Placeholder values (e.g. confirmation deadline, offer freshness) are config defaults, never constants. (I-6) | `config`, `pricing`; code review |
-| **C6** | The live-mode gate is re-checked at execution time for placement and invoice issuance; editing a gated setting revokes its checklist item. (I-7) | `config`, `checkout`, `finance` |
+| **C6** | The live-mode gate is re-checked at execution time: live placement checks verified business configuration; live invoice issuance checks verified business configuration **and** an approved invoice policy; test-mode documents use a test series and can never become tax invoices; editing a gated setting revokes its checklist item. (I-7) | `config`, `checkout`, `finance` |
 | **C7** | Payment state changes only via a signature-verified, idempotent webhook or a recorded COD collection; never from a browser redirect. (I-9) | `finance` webhook handler; unique gateway event id |
 | **C8** | Reversals carry a unique source reference and never exceed the unreversed charge; refunds never exceed the owed limit or the paid limit, each net of completed refunds and pending commitments. (I-8) | `finance`, `returns`; order lock; unique constraints |
 | **C9** | One active assignment per line; a shipment line's assignment source equals the shipment's source; original and replacement quantities are checked separately. (I-4) | DB partial unique index, FK and check constraints |
@@ -64,7 +66,9 @@ Checkable statements; each should be verifiable from the database, logs or tests
 - Every Closed order has customer balance 0 and passes both reconciliation checks (tax documents; customer account).
 - No ledger entry, invoice or credit note was ever updated or deleted.
 - No payment changed state without a verified gateway event or a recorded COD collection.
-- No live order or live invoice was created while the business profile was not verified or the invoice policy was unset.
+- No live order was placed while the business profile was not verified.
+- No live tax invoice was issued without both a verified business profile and an approved invoice policy.
+- No test-mode document was ever issued or numbered as a tax invoice.
 - No order line ever had two active assignments; no shipment ever changed source.
 - No refund exceeded either limit; no system reversal was written twice for the same source.
 - No shipment reached Delivered without an OTP or recorded proof and override.

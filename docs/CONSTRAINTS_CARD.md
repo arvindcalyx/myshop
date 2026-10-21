@@ -11,7 +11,7 @@
 | **C3** | State changes only via transition functions + event record | all stateful modules |
 | **C4** | Order snapshots, invoices, credit notes write-once | DB triggers, `finance` |
 | **C5** | No hardcoded prices, fees, thresholds, zones, timers — versioned config | `config`, `pricing` |
-| **C6** | Live gate re-checked at placement and invoicing; edits revoke checklist items | `config`, `checkout`, `finance` |
+| **C6** | Live gate re-checked: placement needs verified config; tax invoice needs verified config AND approved invoice policy; test docs never tax invoices; edits revoke checklist items | `config`, `checkout`, `finance` |
 | **C7** | Payment state only from verified idempotent webhook or recorded COD | `finance` |
 | **C8** | Reversal ≤ unreversed charge, unique source ref; refund ≤ owed limit AND ≤ paid limit | `finance`, `returns` |
 | **C9** | One active assignment per line; shipment source fixed; original/replacement qty checked separately | DB constraints |
@@ -29,7 +29,7 @@
 | **I-4** | ≤1 active assignment per line; all transitions logged |
 | **I-5** | Integer paise; integer quantities |
 | **I-6** | Versioned config; orders record versions used |
-| **I-7** | No live transaction or invoice without verified config + approved invoice policy |
+| **I-7** | Live transaction needs verified business config; live tax invoice needs verified config AND approved invoice policy (never a substitute); test-mode documents are never tax invoices |
 | **I-8** | Append-only ledger; close only at zero balance with nothing unresolved |
 | **I-9** | Payment status only from verified event or recorded COD |
 
