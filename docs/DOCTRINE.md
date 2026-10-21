@@ -83,7 +83,7 @@ Checkable statements; each should be verifiable from the database, logs or tests
 
 ## 5. Launch blockers (unresolved)
 
-These decisions are **not made**. They do not block building and testing in `TEST` mode; each **blocks switching to `LIVE` mode** through the go-live checklist (spec §4.1). Nothing in this doctrine, the spec or any review resolves them.
+These decisions are **not made**. They do not block building and testing in `TEST` mode; each **blocks switching to `LIVE` mode** through the go-live checklist (spec §4.1). The gate is **global**: any unverified checklist item blocks all live order placement and all live invoice issuance. Nothing in this doctrine, the spec or any review resolves them.
 
 | Blocker | Decision | Requires | Blocks (checklist item) |
 | --- | --- | --- | --- |

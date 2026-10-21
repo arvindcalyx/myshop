@@ -1,11 +1,21 @@
 # Platform Design v1 — MVP Spec
 
-**Status:** v1.3.2 — accepted by owner; I-7 wording aligned with `DOCTRINE.md` (S1 Design) · 2026-10-21 · Arvind
-**Supersedes:** v1.3.1 (commit `0d45232`), v1.3 (commit `20a2132`), v1.2 (commit `0b629ed`), v1.1 (commit `c096573`) and v1.0 (commit `49b8aa1`), same file. Change summary in §0.
+**Status:** v1.4 — S1 design milestone final draft (S1 Design) · 2026-10-21 · Arvind. A design document only: no implementation exists, nothing in it has been tested, and tax/legal compliance is not established (see §14 launch blockers).
+**Supersedes:** v1.3.2 (commit `8d7bb30`), v1.3.1 (commit `0d45232`), v1.3 (commit `20a2132`), v1.2 (commit `0b629ed`), v1.1 (commit `c096573`) and v1.0 (commit `49b8aa1`), same file. Change summary in §0.
 
 ---
 
 ## 0. Change log
+
+### Changes in v1.4 (owner decisions at S1 close)
+
+| Change | Where |
+| --- | --- |
+| D7a closed: Next.js App Router + TypeScript, Drizzle ORM (SQL migrations for triggers/permissions), Graphile Worker on Postgres (direct or session-mode connection). D7 split; hosting and messaging remain open as D7b | §3.2, §11, §14 |
+| Live gate scope stated explicitly as **global** (owner decision; no behaviour change) | §4.1 |
+| §10.7 transaction boundaries and idempotency added (source for ADR-004) | §10.7 |
+| S2 split into S2a (scaffold, operating-model install, processes, logging, health, CI) and S2b (schema, migrations, constraints, persistence tests) | §15 |
+| D13 wording aligned with doctrine (charge reinstatement) | §14 |
 
 ### Changes in v1.3.2 (wording only)
 
@@ -174,13 +184,14 @@ At these numbers the bottleneck is human operations (assignment, delivery), not 
 | --- | --- | --- |
 | Web | Next.js (App Router) + TypeScript, stateless containers, minimum 2 instances for availability | Add instances (horizontal) |
 | Worker | Same codebase, `worker` entrypoint; processes the job queue and schedules | Add instances; jobs are idempotent |
-| Database | Managed Postgres (Mumbai region) with connection pooler | Vertical first; read replica at threshold |
-| Job queue | Postgres-backed queue (e.g. pg-boss or Graphile Worker) | No extra infrastructure until threshold |
+| Database | Managed Postgres (Mumbai region) with connection pooler for web traffic | Vertical first; read replica at threshold |
+| ORM / migrations | **Drizzle ORM + drizzle-kit** (approved, D7a). Tables, indexes, partial unique indexes and check constraints via Drizzle; write-once triggers, insert-only enforcement and DB role permissions via **hand-written SQL migrations** kept in the same migration sequence | — |
+| Job queue | **Graphile Worker on the same Postgres** (approved, D7a). The worker connects **directly or through a session-mode pooler**, never a transaction-mode pooler, because Graphile Worker relies on LISTEN/NOTIFY. Jobs are enqueued from SQL inside the business transaction (§10.7) | Add worker instances; no extra infrastructure until threshold |
 | Cache | CDN cache for catalogue pages and images (revalidated on price/product change); short in-process cache for config | Redis only at threshold |
 | Files | Object storage + CDN for product images, POD photos, invoice PDFs | Managed |
 | Payments | Razorpay (UPI, cards); webhook → queue | — |
 | Messaging | Indian SMS/WhatsApp provider (e.g. MSG91, Gupshup) via worker | — |
-| Hosting | A container platform with a Mumbai region that runs both web and worker processes **(vendor = D7)** | — |
+| Hosting | A container platform with a Mumbai region that runs both web and worker processes **(vendor = D7b, open)** | — |
 
 Serverless-only hosting is not recommended because the worker needs a long-running process for queues and schedules.
 
@@ -283,6 +294,7 @@ Business rules live in configuration tables edited through admin, validated by t
 - In `TEST` mode: dummy profile data allowed; only gateway test keys; invoices and credit notes watermarked and numbered from a test series; a banner on storefront and admin. All invoice policies can be exercised in test mode.
 - Switching to `LIVE` requires `VERIFIED` status. The switch is an Owner-only action, logged.
 - Live placement and live invoice issuance re-check the gate at execution time.
+- **Gate scope is global (owner decision, 2026-10-21):** if **any** checklist item L1–L10 is unverified, `BusinessProfile.status` is not `VERIFIED` and **all** live order placement and **all** live invoice issuance are blocked — not only the operation the item relates to. Orders already placed continue through fulfilment, delivery, returns and refunds. Changing to per-operation gating would be a doctrine-level decision.
 - **Automatic revocation:** editing any setting a checklist item depends on (e.g. GSTIN, legal name, invoice policy, gateway keys) resets that item to unverified. In `LIVE` mode this blocks new placements and invoice issuance until re-verified; orders already placed continue through fulfilment.
 
 **Go-live checklist** — stored as records with evidence, verifier and timestamp; each item verified by the Owner.
@@ -825,11 +837,36 @@ These scenarios were checked against a minimal model of the rules during design;
 
 Supplier payouts themselves are made outside the system in v1 and recorded as settled.
 
+### 10.7 Transaction boundaries and idempotency
+
+The source of truth for ADR-004. Each row is **one database transaction**: either everything in it commits or nothing does.
+
+| # | Boundary | Writes in the one transaction | Idempotency / concurrency guard |
+| --- | --- | --- | --- |
+| TX-1 | Order placement | Order, lines, quote snapshot, OrderEvent; COD: customer charges; notification job | Unique `idempotency_key` per customer; re-quote check (§4.3) |
+| TX-2 | Apply verified gateway capture | Payment transition, OrderEvent; if order is Payment pending and not expired: order → Placed, customer charges, PAYMENT_RECEIVED, GATEWAY_RECEIVABLE; if Expired: PAYMENT_RECEIVED, GATEWAY_RECEIVABLE, automatic Refund (Requested) | Unique gateway event id; raw event stored before processing; order row lock |
+| TX-3 | Record delivery outcome for a shipment | Shipment transition, shipment-line quantities, CHARGE_REVERSAL for refused/damaged/short qty, SUPPLIER_PAYABLE for delivered qty, COD_COLLECTED + COD_CUSTODY (equal), credit notes for already-invoiced reversed amounts, invoice if policy is `AT_DELIVERY`, OrderEvents, notification jobs | Shipment transition guard (only from Out for delivery); unique source ref on each reversal; order row lock |
+| TX-4 | Supplier failure before dispatch | Shipment → Cancelled, assignment → Supplier failed, OrderEvents | Transition guards; never moves a shipment to another source (§9.3a) |
+| TX-5 | Return goods received / return resolved | Return transition; REFUND resolution: CHARGE_REVERSAL (+ credit note if invoiced); SUPPLIER_CREDIT if liable; replacement delivered: charge reinstatement if applicable | Unique source ref (ReturnRequest); conversion key `return_request_id + CONVERT_TO_REFUND` |
+| TX-6 | Refund request or approval | Refund row / transition, OrderEvent — **no ledger entry** | Order row lock (`SELECT … FOR UPDATE`); both refund limits checked inside the lock (§10.2 inv. 4) |
+| TX-7 | Refund completion | Refund → Completed, REFUND_PAID, GATEWAY_REFUND (prepaid), OrderEvent, notification job | Gateway refund idempotency key = refund id; unique gateway refund id |
+| TX-8 | Netting settlement | Settlement record, COD_NETTED, SUPPLIER_SETTLED_BY_NETTING | Settlement id on both entries; DB check that amounts are equal |
+| TX-9 | Invoice / credit-note issuance (non-delivery triggers) | Document row with next number, OrderEvent | Lock on the number-series row (gapless); live gate re-checked (I-7) |
+| TX-10 | Order close / reopen | Order transition, OrderEvent | Close guard evaluated inside an order row lock (§9.1) |
+
+**Rules that apply to every boundary**
+1. **No external calls inside a transaction.** Gateway, messaging and file-storage calls happen outside; their results are applied through an idempotent transition (TX-2, TX-7).
+2. **Transactional enqueue.** Background jobs (notifications, PDFs, follow-up checks) are added with Graphile Worker's SQL `add_job` inside the same transaction, so a job exists only if the business change committed.
+3. **At-least-once jobs.** Graphile Worker may run a job more than once; every handler is idempotent (unique keys or state checks), and scheduled checks use stable job keys.
+4. **Append-only by permission.** The application's DB role has no UPDATE or DELETE on ledger, event, invoice or credit-note tables; a trigger rejects them as well (I-3, I-8).
+5. **One lock order.** When a transaction needs several locks, it takes them in a fixed order — order row, then number-series row — to avoid deadlocks.
+6. **Reconciliation requirements** are those of §10.4 (two checks) and §10.5 (views); both read only committed ledger and document rows.
+
 ---
 
 ## 11. Notifications
 
-Sent by the worker; templates editable in admin; every send logged with provider receipt. Channel per event: WhatsApp first, SMS fallback **(provider and template approval, D7)**.
+Sent by the worker; templates editable in admin; every send logged with provider receipt. Channel per event: WhatsApp first, SMS fallback **(provider and template approval, D7b)**.
 
 | Event | Customer | Owner/ops |
 | --- | --- | --- |
@@ -897,13 +934,14 @@ Nothing below is decided by this document. Placeholders are marked where used.
 | D4 | Delivery charge bands, minimum order, free-delivery thresholds | Needs real Gurgaon transport quotes | Owner | Rule values before live |
 | D5 | COD allowed, cap, refusal policy | Off · capped · uncapped | Owner | Checkout, reconciliation |
 | D6 | Launch pincodes and zones | 4–6 sectors or all Gurgaon | Owner | Zone configuration |
-| D7 | Stack, hosting vendor, SMS/WhatsApp provider | §3 recommendation | Owner | S2 |
+| D7a | Application stack | **Decided 2026-10-21:** Next.js App Router + TypeScript; Drizzle ORM (SQL migrations for triggers and permissions); Graphile Worker on Postgres (direct or session-mode connection) | Owner | — (closed) |
+| D7b | Hosting vendor; SMS/WhatsApp provider | Container platform with Mumbai region (§3.2); Indian SMS/WhatsApp provider | Owner | Deployment; S11 notifications |
 | D8 | Launch SKU list (30–50) | — | Owner | Catalogue seed |
 | D9 | Platform fees: whether to charge, labels shown to customers | — | Owner | Fee rules, checkout display |
 | D10 | Return policy: window length, change-of-mind, redelivery and restocking charges, whether delivery charge is reversed on partial delivery or refusal | — | Owner (+ lawyer for terms) | Returns, order closure, Examples 3 and 5 |
 | D11 | Supplier confirmation deadline and escalation limit | Placeholder: 4 working hours | Owner | Timers |
 | D12 | Offer freshness window | Placeholder: 7 days | Owner | Availability |
-| D13 | Invoice policy (`AT_PLACEMENT` / `AT_DISPATCH` / `AT_DELIVERY`, §10.4); GST on delivery charges and platform fees; credit-note rules; documents that travel with goods (delivery challan / e-way bill where applicable) | — | **CA** | Live invoicing (checklist L4) |
+| D13 | Invoice policy (`AT_PLACEMENT` / `AT_DISPATCH` / `AT_DELIVERY`, §10.4); GST on delivery charges and platform fees; credit-note rules, including charge reinstatement (§9.5); documents that travel with goods (delivery challan / e-way bill where applicable) | — | **CA** | Live invoicing (checklist L4) |
 | D14 | COD refund method | Bank/UPI transfer | Owner | Refund workflow |
 | D15 | Delivery OTP mandatory | Mandatory with Owner override | Owner | Delivered transition |
 | D16 | Privacy notice, data retention, consent text (incl. future location tracking) | — | **Lawyer** | Launch |
@@ -913,12 +951,13 @@ Nothing below is decided by this document. Placeholders are marked where used.
 
 ## 15. Build sequence
 
-Twelve sessions, each one PR with one scope. Risk tier per the operating model: money, persistence and auth paths are High.
+Thirteen sessions (S2 split into S2a and S2b), each one PR with one scope. Risk tier per the operating model: money, persistence and auth paths are High. No session before S7 implements payments or refunds; S2a and S2b contain no business features and no live credentials.
 
 | Session | Intent | Scope | Risk |
 | --- | --- | --- | --- |
-| S1 | Design | This spec (v1.1) + independent validation; `DOCTRINE.md`, `CONSTRAINTS_CARD.md`; ADR-001 operating model, ADR-002 Product/Offer/Assignment, ADR-003 modular monolith + worker | — |
-| S2 | Implementation | Repo scaffold, operating-model templates, web + worker processes, DB + migrations for all MVP tables, logging, error monitoring, health checks, CI | High |
+| S1 | Design | This spec + independent validation; `DOCTRINE.md`, `CONSTRAINTS_CARD.md`; ADR-001 operating model, ADR-002 Product/Offer/Assignment/Shipment, ADR-003 modular monolith + worker, ADR-004 financial ledger (§10.7). Closes as a design/documentation milestone only | — |
+| S2a | Implementation | Repo scaffold (Next.js App Router + TypeScript), module folders and boundary lint rules, operating-model installation, web and worker (Graphile Worker) entry points, structured logging, error-monitoring hook, health checks, CI (lint, type-check, tests). No database schema beyond what Graphile Worker installs for itself | Medium |
+| S2b | Implementation | Drizzle schema and migrations for all MVP tables in §5; hand-written SQL migrations for write-once triggers, insert-only tables and DB role permissions; constraints from I-3, I-4, I-5, I-8; persistence tests proving each constraint rejects violations | High |
 | S3 | Implementation | `config`: business profile, test/live gate with go-live checklist and automatic revocation, invoice policy setting, rule sets and versioning, zones, slots, reason codes | High |
 | S4 | Implementation | Catalogue and storefront browsing | Low |
 | S5 | Implementation | `pricing` quote engine, cart, quantity rules, pincode gate | Medium |

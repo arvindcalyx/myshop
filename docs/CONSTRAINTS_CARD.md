@@ -35,7 +35,7 @@
 
 ## Launch blockers — LIVE mode blocked until resolved (Doctrine §5)
 
-D1 seller of record/GST (CA) · D13 invoice policy and tax treatment (CA) · D16 privacy/retention (lawyer) · D10 return/refund terms (lawyer) · D17 supplier terms (lawyer). Test-mode build may proceed.
+D1 seller of record/GST (CA) · D13 invoice policy, tax treatment, credit-note rules incl. charge reinstatement (CA) · D16 privacy/retention (lawyer) · D10 return/refund terms (owner + lawyer) · D17 supplier terms (owner + lawyer). Any unverified checklist item blocks **all** live placement and invoicing. Test-mode build may proceed.
 
 ---
 
