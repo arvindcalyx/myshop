@@ -1,11 +1,26 @@
 # Platform Design v1 — MVP Spec
 
-**Status:** v1.1 draft for review (S1 Design) · 2026-10-21 · Arvind
-**Supersedes:** v1.0 (same file, commit `49b8aa1`). v1.1 adds configurable business/tax settings, a configurable commercial model, a full delivery and returns lifecycle, a financial ledger and a capacity-sized architecture. Change summary in §0.
+**Status:** v1.2 draft for review (S1 Design) · 2026-10-21 · Arvind
+**Supersedes:** v1.1 (commit `c096573`) and v1.0 (commit `49b8aa1`), same file. Change summary in §0.
 
 ---
 
-## 0. Changes in v1.1
+## 0. Change log
+
+### Changes in v1.2 (second independent review)
+
+| Finding | Change | Where |
+| --- | --- | --- |
+| A. Ledger sign convention and reconciliation unclear | Single accounting equation per account; refund request ≠ money movement; five worked examples (prepaid, COD, partial delivery, return, refused COD) | §10 |
+| B. Supplier failure after a shipment exists | Shipment lines reference an assignment; supplier failure cancels and supersedes the shipment and assignment together; new assignment + new shipment; source of a shipment never edited; assignment gains Completed state | §5, §9.3, §9.4 |
+| C. Immutable order vs adjustments | Three record layers (intent, operations, finance); ledger customer account is the authoritative balance; invoice − credit notes must equal net charges for invoiced lines | §2 I-3, §10.1 |
+| D. Invoice timing undefined | Invoice policy is a required live-mode setting with three defined options and their credit-note consequences; live invoicing blocked until set and CA-approved (D13) | §4.1, §10.4 |
+| E. Load test underspecified | Mixed workload profile, saturation and queue-lag tests, pass criteria | §3.7 |
+| F. Supplier privacy vs delivery contact | I-1 now distinguishes supplier identity/commercial data from the delivery contact needed to receive goods; supplier paperwork rule moved into supplier terms (D17) | §2, §8, §14 |
+| G. Return window and closure | Window starts per line at delivery; requests before expiry keep the order open; refund request is not a ledger movement; Failed refunds block closure; Owner-only reopen | §9.1, §9.5 |
+| H. Live gate was a flag | Go-live checklist with evidence, verifier and automatic revocation; supplier verification before live assignment | §4.1, §5 |
+
+### Changes in v1.1
 
 | Area | Change | Driven by |
 | --- | --- | --- |
@@ -68,6 +83,7 @@ These are structural; retrofitting them later is expensive.
 | Own inventory | No stock held | `source_type = OWN_STOCK` (§13) |
 | Marketplace seller model | Legal restructure, not a setting (§13) | Financial components kept distinct |
 | Automated supplier routing | Manual is faster at this volume | Offers carry cost, lead time, zone |
+| Splitting one order line across suppliers | Rare at small quantities; complicates reconciliation | Assignment carries `qty`; shipment lines carry quantities |
 | Bulk CSV imports, analytics dashboards | 30–50 SKUs; single edits suffice | Admin APIs are per-record |
 | Coupons, credit accounts, contractor pricing tiers | Not core to validating demand | Pricing rules accept new rule types |
 | Redis, read replicas, separate services | Not needed at target load (§3.4) | Thresholds documented |
@@ -85,17 +101,17 @@ Proposals to lift into `DOCTRINE.md` §2. Each names how it is enforced, so a vi
 
 | | Invariant | Enforcement |
 | --- | --- | --- |
-| **I-1** | A supplier never appears on any customer-facing surface. | Storefront API returns customer DTOs that have no supplier fields; `catalog`/`checkout` cannot import `fulfilment` (lint rule); notification templates have no supplier variables; contract test asserts storefront responses contain no supplier data. |
+| **I-1** | Supplier identity and commercial data (supplier name, GSTIN, address, offers, costs) never appear on any customer-facing surface. The only fulfilment data a customer sees is the **delivery contact** needed to receive the order: delivery person's name, phone, vehicle number and ETA — never the supplier's business name, even when the supplier's own driver delivers. | Storefront API returns customer DTOs that have no supplier fields; `catalog`/`checkout` cannot import `fulfilment` (lint rule); delivery contact comes from `DeliveryExecutor` only; notification templates have no supplier variables; contract test asserts storefront responses and notifications contain no supplier data. Physical paperwork from suppliers is governed by supplier terms (D17). |
 | **I-2** | Goods price, supplier cost, platform fees, delivery charge and delivery cost are separate financial components with separate owners. | Separate columns and ledger entry types; operator role cannot read cost or margin fields (API-level authorisation, not just hidden UI). |
-| **I-3** | A placed order and any issued financial document are immutable. Corrections are new records. | Money and snapshot columns are write-once (DB trigger rejects updates after placement); invoices and credit notes are insert-only; changes go through adjustments, credit notes or refunds. |
-| **I-4** | Each order line has at most one active fulfilment assignment; every state change goes through the entity's transition function and is logged with actor, timestamp, reason code and note. | Partial unique index `(order_line_id) WHERE active`; transition functions run in one DB transaction with the event insert; direct status updates outside transition functions blocked by code review rule and DB role permissions; event table is insert-only. |
+| **I-3** | A placed order's snapshot and any issued financial document are immutable. What happened afterwards is recorded in operational records; what it costs is recorded in financial records (§10.1). Corrections are always new records. | Money and snapshot columns are write-once (DB trigger rejects updates after placement); invoices and credit notes are insert-only; changes go through charge reversals, adjustments, credit notes or refunds. |
+| **I-4** | Each order line has at most one active fulfilment assignment; a shipment line always references the assignment it fulfils, and a shipment's source never changes; every state change goes through the entity's transition function and is logged with actor, timestamp, reason code and note. | Partial unique index `(order_line_id) WHERE active`; FK from shipment line to assignment plus check that the assignment's source equals the shipment's source; quantity check: Σ quantity in non-cancelled shipment lines for an order line ≤ qty_ordered − qty_cancelled; transition functions run in one DB transaction with the event insert; direct status updates blocked by DB role permissions; event table is insert-only. |
 | **I-5** | Money is integer paise; quantities are integers in the product's selling unit. | `bigint` paise columns; `integer` quantities with a check constraint `> 0`; no fractional quantities in v1. |
 | **I-6** | Business rules are versioned configuration; an order records the exact rule versions and computed amounts it used. | Published rule versions are immutable; edits create a new version with `effective_from`; order stores rule version ids plus computed values. |
 | **I-7** | No live transaction or tax invoice without a verified business configuration. | Placement in live mode and invoice issuance both check `BusinessProfile.status = VERIFIED` and `system_mode = LIVE`; test mode allows dummy data, uses gateway test keys only, and watermarks documents "TEST — not a tax invoice". |
-| **I-8** | Every money movement is an append-only ledger entry; an order closes only when its customer balance is zero. | `LedgerEntry` insert-only; close transition guard checks `sum(charges) − sum(payments) + sum(refunds) = 0`. |
+| **I-8** | Every money movement is an append-only ledger entry; the ledger customer account is the authoritative customer balance; an order closes only when that balance is zero and no return or refund is unresolved. | `LedgerEntry` insert-only; one accounting equation (§10.2); close transition guard (§9.1). A refund request or approval creates no ledger entry — only a completed refund does. |
 | **I-9** | Payment status changes only from a verified, idempotent gateway event or a recorded COD collection — never from a browser redirect. | Webhook signature verification; unique constraint on gateway event id; COD collection is an admin action with actor and executor recorded. |
 
-**Candidate refusals:** no supplier-facing surfaces in v1; no automated price changes; no orders outside serviced zones; no live orders without verified business configuration; no "delivered" without OTP or recorded proof.
+**Candidate refusals:** no supplier-facing surfaces in v1; no automated price changes; no orders outside serviced zones; no live orders without verified business configuration; no live tax invoice without an approved invoice policy; no "delivered" without OTP or recorded proof.
 
 ---
 
@@ -123,6 +139,8 @@ The target is **100,000 application requests per day**. Requests are not orders 
 | Database size, year 1 | < 5 GB excluding images | ~30,000 orders × lines, events, ledger |
 
 At these numbers the bottleneck is human operations (assignment, delivery), not compute.
+
+**Not the same thing:** 100,000 requests/day ≈ 4,000 sessions ≈ 80 orders. It is not 100,000 users/day or 100,000 orders/day; either of those would be a different design exercise. The architecture is called **proven** for this target only after the §3.7 load test passes.
 
 ### 3.2 Deployment topology
 
@@ -187,6 +205,34 @@ Each module is a folder that owns its tables and exposes a typed internal API; c
 - **Backups:** managed daily backups with point-in-time recovery; a monthly restore test into a scratch database, recorded in the ops log.
 - **Security:** admin email + password with 2FA, session expiry (8 h idle), password reset via verified email; role-based access (Owner, Operator); admin access log; rate limits on OTP and login; secrets in the platform secret store; customer data access restricted to roles that need it; privacy notice and retention policy **(D16)**.
 
+### 3.7 Load-test profile (S12)
+
+Run against a production-sized staging environment (same instance sizes, pool size and seeded data: 50 products, 5,000 customers, 20,000 historical orders) with the worker running.
+
+| Workload | Share of requests | Notes |
+| --- | --- | --- |
+| Catalogue, category and product pages | 55% | Mix of CDN-cached and uncached (cache-busted) requests |
+| Search | 10% | Uncached |
+| Cart updates and quotes | 12% | Writes to cart; quote evaluation |
+| Checkout and order placement | 3% | Includes idempotency-key replays (5% of placements) |
+| Order-status polling | 10% | Every 5 s per active confirmation page |
+| Admin operations | 8% | Order lists, assignment, shipment updates |
+| Payment webhooks | 2% | Includes 10% duplicate deliveries and out-of-order events |
+| Background jobs (concurrent) | — | Notification burst of 500 jobs in 60 s; scheduled checks every minute |
+
+**Tests and pass criteria**
+
+| Test | Pass |
+| --- | --- |
+| Sustained 50 requests/s for 15 min with the mix above | p95 < 500 ms reads, < 1.5 s placement; error rate < 0.5% |
+| Spike: 0 → 100 requests/s in 30 s, hold 2 min | No 5xx from saturation; recovery to normal p95 within 2 min |
+| Connection saturation: drive DB connections to pool limit | Requests queue then succeed or fail fast with 503; no pool exhaustion crash; alerts fire |
+| Queue lag under notification burst | Lag returns below 60 s within 3 min; no duplicate sends |
+| Webhook duplicates and reordering | Exactly one payment transition per gateway event; ledger balances correct |
+| Placement concurrency: 20 simultaneous submissions of one cart with the same idempotency key, while a price rule is published mid-test | Exactly one order; it carries either the old or new quote consistently, never a mix |
+
+Results are recorded in the S12 handoff. If any test fails, §3.4 thresholds are revisited before launch.
+
 ---
 
 ## 4. Configuration model
@@ -202,14 +248,33 @@ Business rules live in configuration tables edited through admin, validated by t
 | Invoice and credit-note number series | Per financial year; gapless sequence |
 | Support phone, email, terms/refund policy URLs | Shown on storefront and invoices |
 | Gateway mode and keys | Test keys in test mode; live keys only accepted when profile verified |
+| Invoice policy | `AT_PLACEMENT`, `AT_DISPATCH` or `AT_DELIVERY` (§10.4); unset until approved (D13) |
 | `system_mode` | `TEST` or `LIVE` |
-| `BusinessProfile.status` | `INCOMPLETE` → `TEST_READY` → `VERIFIED` (owner attests after CA confirmation, D1) |
+| `BusinessProfile.status` | `INCOMPLETE` → `TEST_READY` → `VERIFIED`; `VERIFIED` only when every go-live checklist item below is verified |
 
 **Gate rules (I-7):**
 
-- In `TEST` mode: dummy profile data allowed; only gateway test keys; invoices and credit notes watermarked and numbered from a test series; a banner on storefront and admin.
-- Switching to `LIVE` requires `VERIFIED` status, live gateway keys, an invoice series and at least one active zone, supplier and product. The switch is an Owner-only action, logged.
-- Live placement and invoice issuance re-check the gate at execution time.
+- In `TEST` mode: dummy profile data allowed; only gateway test keys; invoices and credit notes watermarked and numbered from a test series; a banner on storefront and admin. All invoice policies can be exercised in test mode.
+- Switching to `LIVE` requires `VERIFIED` status. The switch is an Owner-only action, logged.
+- Live placement and live invoice issuance re-check the gate at execution time.
+- **Automatic revocation:** editing any setting a checklist item depends on (e.g. GSTIN, legal name, invoice policy, gateway keys) resets that item to unverified. In `LIVE` mode this blocks new placements and invoice issuance until re-verified; orders already placed continue through fulfilment.
+
+**Go-live checklist** — stored as records with evidence, verifier and timestamp; each item verified by the Owner.
+
+| # | Item | Evidence retained | Depends on |
+| --- | --- | --- | --- |
+| L1 | Business legal details and GSTIN | GST registration certificate; GSTIN format/checksum pass; state code matches address | D1 |
+| L2 | PAN and settlement bank account | PAN copy; gateway KYC approval | — |
+| L3 | Seller-of-record model confirmed | CA confirmation (letter or email) | D1 |
+| L4 | Invoice policy and tax treatment of delivery charges and fees approved | CA confirmation; selected policy recorded | D13 |
+| L5 | Invoice and credit-note series configured for the financial year | Series configuration | — |
+| L6 | Live gateway keys | ₹1 live payment and refund completed end to end | — |
+| L7 | Terms, refund/return policy, privacy notice published | Published URLs and versions | D10, D16 |
+| L8 | Commercial rules configured | Published versions for prices, delivery charges, minimums, zones, slots, COD policy | D4, D5, D6 |
+| L9 | At least one verified supplier per launch category | Supplier verification records | D17 |
+| L10 | Restore test and load test passed | S12 results | §3.6, §3.7 |
+
+**Supplier verification:** a supplier is `DRAFT` until the Owner records its GSTIN (validated), signed supplier terms (D17) and contact verification; then `VERIFIED`. In live mode only verified suppliers' offers can be assigned.
 
 **Seller of record:** v1.1 models the **reseller flow** (the business buys from suppliers and sells to customers under its own GSTIN) as the working assumption. This is **not decided** — D1 requires CA confirmation of GST treatment, invoicing and accounting before launch.
 
@@ -276,19 +341,21 @@ flowchart LR
 
 | Entity | Key fields | Module | Notes |
 | --- | --- | --- | --- |
-| BusinessProfile | legal/trade name, address, state code, GSTIN, PAN, invoice series, status | config | Singleton per legal entity |
+| BusinessProfile | legal/trade name, address, state code, GSTIN, PAN, invoice series, invoice policy, status | config | Singleton per legal entity |
+| GoLiveChecklistItem | item code, status, evidence refs, verified_by, verified_at, depends_on settings | config | Revoked automatically when a dependency changes (§4.1) |
 | RuleSet / RuleVersion | type, version, criteria JSON (schema per type), output, effective_from, published_by | config | Published versions immutable (I-6) |
 | ReasonCode | category, code, label, customer_visible, active | config | Categories fixed in code; codes admin-editable |
 | Zone / ServiceArea | city, zone, pincodes, active, lead time, slot set | config | |
 | Category | name, slug, parent, sort | catalog | Two levels max |
 | Product | name, brand, spec, sell_unit, min/step/max qty, weight_kg_per_unit, hsn_code, gst_rate, status, images | catalog | Never references a supplier |
-| Supplier | name, contact, phone, **supplier GSTIN**, address, zones served, status, can_deliver | fulfilment | No login in v1 |
+| Supplier | name, contact, phone, **supplier GSTIN**, address, zones served, status (DRAFT / VERIFIED / SUSPENDED), verification evidence, can_deliver | fulfilment | No login in v1; only VERIFIED assignable in live mode |
 | Offer | supplier, product, current cost (via cost rule), lead_time_hours, available, last_confirmed_at | fulfilment | Orderable only if confirmed within freshness window |
 | Customer / Address | phone, name; lines, landmark, pincode, optional lat/lng | identity | Address pincode must map to an active zone |
 | Order | number, customer, address snapshot, slot, quote snapshot (components + rule version ids), payment_method, status, idempotency_key, placed_at | orders | Snapshot write-once (I-3) |
-| OrderLine | order, product, product snapshot (name, unit, hsn, gst_rate), unit_price_paise, qty_ordered, qty_delivered, qty_damaged, qty_returned, qty_cancelled, tax snapshot | orders | Quantities reconcile: delivered + cancelled + undelivered = ordered |
-| FulfilmentAssignment | order_line, source_type, supplier, offer, cost snapshot, state, confirm_deadline, assigned_by/at, active | fulfilment | One active per line (I-4) |
-| Shipment | order, source (supplier or own stock), lines + quantities, slot, state, executor, ETA, delivery OTP hash, POD refs | delivery | Lines from one source to one address on one slot |
+| OrderLine | order, product, product snapshot (name, unit, hsn, gst_rate), unit_price_paise, qty_ordered, qty_delivered, qty_damaged, qty_returned, qty_cancelled, tax snapshot | orders | Quantities reconcile: qty_ordered = delivered (net of damaged/refused) + cancelled + still open; returned ≤ delivered |
+| FulfilmentAssignment | order_line, qty, purpose (ORIGINAL / REPLACEMENT), source_type, supplier, offer, cost snapshot, state, confirm_deadline, assigned_by/at, active, superseded_by | fulfilment | One active per line (I-4); inactive once Completed, Rejected, Timed out or Failed |
+| Shipment | order, source (supplier or own stock), slot, state, executor, ETA, delivery OTP hash, POD refs, delivery cost, supersedes | delivery | One source to one address on one slot; source never edited |
+| ShipmentLine | shipment, order_line, assignment, qty planned, qty delivered, qty damaged, qty refused | delivery | Assignment source must equal shipment source (I-4) |
 | DeliveryExecutor | type (SUPPLIER / OWN / THIRD_PARTY), name, phone, vehicle no, external ref | delivery | Entered manually in MVP |
 | DeliveryAttempt | shipment, attempt no, outcome, reason code, notes, evidence, at, actor | delivery | One per attempt |
 | ReturnRequest | order line(s), type, qty, reason code, evidence, state, resolution (refund / replacement), pickup shipment | returns | |
@@ -369,7 +436,7 @@ A mobile-first web app; landing to placed order in under 2 minutes; login only a
 | Payment pending | Payment pending (visible on the order page with retry; expires in 30 min) |
 | Placed | Placed, assignment in progress |
 | Confirmed — delivery on {date, slot} | All lines supplier-confirmed, shipments scheduled |
-| Out for delivery — {driver name, phone, ETA} | Any shipment out for delivery |
+| Out for delivery — {delivery person, phone, vehicle no, ETA} | Any shipment out for delivery; delivery contact only, never the supplier's name (I-1) |
 | Delivered / Partially delivered | All shipments terminal; quantities reconcile |
 | Rescheduled to {date} | Failed attempt or delay with new slot |
 | Cancelled | All lines cancelled |
@@ -391,11 +458,22 @@ All states change only through each entity's transition function, which checks t
 | Placed | Paid or COD | Confirmed · Cancelled |
 | Confirmed | Every active line supplier-confirmed | In delivery · Cancelled (with refund/supplier handling) |
 | In delivery | Any shipment out for delivery | Delivered · Partially delivered |
-| Delivered | All lines fully delivered | Closed · (returns may open) |
+| Delivered | All lines fully delivered | Closed · (returns may open within window) |
 | Partially delivered | All shipments terminal, some quantity undelivered or damaged | Closed after refund/redelivery resolves |
-| Closed | Return window passed (D10), no open returns/refunds, ledger balance = 0 (I-8) | — |
-| Cancelled | All lines cancelled; refunds issued if paid | Closed when refund completed |
+| Closed | Close guard passes (below) | Reopened (Owner only, with reason) |
+| Reopened | Owner records a post-closure issue (late claim, goodwill adjustment, dispute) | Closed when the close guard passes again |
+| Cancelled | All lines cancelled | Closed when the close guard passes (refunds completed) |
 | Expired | Payment pending timed out | — (late payment → auto-refund) |
+
+**Close guard** (checked by the worker daily and on every relevant transition):
+1. Every shipment is terminal and every line's quantities reconcile (§5).
+2. The return window (D10) has ended for every delivered line (§9.5).
+3. No ReturnRequest is in a non-terminal state.
+4. No Refund is Requested, Approved, Processing or **Failed** — a failed refund must be retried or completed by another method first.
+5. Ledger customer balance = 0 (§10.2).
+6. For invoiced lines: invoice total − credit-note total = net charges (§10.4).
+
+Supplier and delivery payables do **not** block closure; they are settled by period (§10.5).
 
 ### 9.2 Payment
 
@@ -411,11 +489,24 @@ All states change only through each entity's transition function, which checks t
 
 | State | Next | Guard / notes |
 | --- | --- | --- |
-| Unassigned | Assigned | Offer must serve zone and be fresh |
+| (line has open qty, no active assignment) | Assigned | Offer must serve zone, be fresh and (live mode) belong to a verified supplier |
 | Assigned | Supplier confirmed · Supplier rejected · Confirmation timed out | Deadline = assigned_at + SLA (D11) |
-| Supplier confirmed | Ready for pickup / dispatch · Supplier failed | |
-| Supplier rejected / timed out / failed | — (assignment deactivated) | Line returns to Unassigned; reason code required |
-| Unassigned for longer than escalation limit, or no fresh offer | Line cancelled | Owner approval; customer notified; refund for that line |
+| Supplier confirmed | Completed · Supplier failed | Shipment lines may only be created from this state |
+| Completed | — (inactive) | All its shipment lines terminal; set automatically |
+| Supplier rejected / Timed out / Supplier failed | — (inactive) | Reason code required; line's open qty is unassigned again |
+| Line open qty unassigned beyond escalation limit, or no fresh offer | Line (open qty) cancelled | Owner approval; customer notified; charge reversal and refund for that qty |
+
+**v1 rule:** one order line is fulfilled by one supplier at a time. Splitting a line across suppliers is deferred; if a supplier can supply only part, the Owner either reassigns the whole line or cancels the shortfall quantity with the customer's consent.
+
+### 9.3a Assignment and shipment consistency
+
+| Event | Allowed from shipment state | Effect, in one transaction |
+| --- | --- | --- |
+| Supplier fails or withdraws after a shipment exists | Scheduled, Ready for dispatch, Delayed | Shipment → **Cancelled** (reason `SUPPLIER_FAILED`); assignment → Supplier failed (inactive); event logged on both. Owner creates a **new** assignment (`superseded_by` links old → new) and, once confirmed, a **new** shipment (`supersedes` links new → old). The old shipment and assignment are kept unchanged as history. |
+| Supplier problem discovered while Out for delivery | Out for delivery | Not a supplier-failure transition: recorded as a delivery attempt outcome or partial delivery (§9.4), then handled as short delivery or return. |
+| Reassignment requested on a line with a non-cancelled shipment | — | **Rejected.** The shipment must be cancelled first; a shipment is never moved to another source. |
+| Replacement after an approved return | — | New assignment with `purpose = REPLACEMENT` for the replacement qty (the original is already Completed, so I-4 holds), then a new shipment linked to the ReturnRequest. |
+| Failed attempt, same supplier redelivers | Attempt failed | Same shipment rescheduled; assignment unchanged. |
 
 ### 9.4 Shipment
 
@@ -453,9 +544,15 @@ stateDiagram-v2
 | Short delivery | Recorded at delivery | Refund for missing qty, or redelivery shipment |
 | Change of mind | Customer request | Only if allowed by policy (D10) |
 
-ReturnRequest states: Requested → Approved / Rejected → Pickup scheduled → Picked up → Received / Returned to supplier → Resolved. Replacement creates a new shipment linked to the return. Supplier liability for damaged or incorrect goods depends on supplier terms (D17).
+ReturnRequest states: Requested → Approved / Rejected → Pickup scheduled → Picked up → Received / Returned to supplier → Resolved. Replacement follows §9.3a. Supplier liability for damaged or incorrect goods depends on supplier terms (D17).
 
-Refund states: Requested → Approved (Owner) → Processing → Completed / Failed. Prepaid refunds go back through the gateway; COD refunds by bank/UPI transfer, recorded manually (D14). Each completed refund writes a ledger entry and, where an invoice was issued, a credit note.
+**Return window:**
+- Starts per order line at the timestamp its delivered quantity was recorded (the last delivering shipment for that line). Damage, short and incorrect-item claims made at the door are recorded on the shipment and need no return request.
+- Length set by return policy (D10); shown on the order page with the exact end time.
+- A request created before the window ends keeps the order open until that request is resolved, however long resolution takes.
+- A request after the window ends is rejected automatically; the Owner can accept it by reopening the order with a reason.
+
+Refund states: Requested → Approved (Owner) → Processing → Completed / Failed; Failed → Processing (retry or another method) → Completed. Prepaid refunds go back through the gateway; COD refunds by bank/UPI transfer, recorded manually (D14). **Only Completed writes a ledger entry** (§10); requested, approved and failed refunds are status only.
 
 ### 9.6 Tracking (designed, deferred)
 
@@ -467,7 +564,7 @@ Refund states: Requested → Approved (Owner) → Processing → Completed / Fai
 | Situation | Detection | Recovery |
 | --- | --- | --- |
 | Supplier rejects or does not confirm in time | Transition or scheduled timeout | Line unassigned; admin reassigns; if no source before escalation limit → cancel line, refund, notify customer |
-| Supplier has stock issue after confirming | Admin records "supplier failed" | Same as above; shipment rescheduled if partial |
+| Supplier has stock issue after confirming | Admin records "supplier failed" | Shipment cancelled and superseded, new assignment and shipment (§9.3a) |
 | Payment captured after expiry | Late webhook | Automatic refund; customer notified |
 | Duplicate submission | Idempotency key | Return existing order |
 | Delivery delayed | ETA missed (scheduled check) | Shipment → Delayed; customer notified with new ETA |
@@ -476,30 +573,137 @@ Refund states: Requested → Approved (Owner) → Processing → Completed / Fai
 | Partial / damaged / incorrect at delivery | Delivered quantities and reason codes | Partially delivered; refund or redelivery/replacement |
 | Customer cancels before confirmation | Customer action | Lines cancelled; refund if paid |
 | Customer cancels after confirmation | Support request | Owner decides; supplier cancellation or return-to-supplier cost recorded |
-| COD cash not handed over | Daily reconciliation mismatch | Flag executor; open adjustment |
+| COD cash not handed over | Executor account balance > 0 after handover deadline (§10.5) | Flag executor; Owner follows up; write-off only by Owner with reason |
 
 ---
 
 ## 10. Financial reconciliation
 
-Every money movement is a `LedgerEntry` (I-8). Entry types:
+The ledger customer account is the single authoritative answer to "what does this customer owe, or are owed, on this order". Tax documents are reconciled against it, never the other way round.
 
-| Type | Sign (customer balance) | Created by |
+### 10.1 Three layers of record
+
+| Layer | Records | Mutability |
 | --- | --- | --- |
-| GOODS_CHARGE, DELIVERY_CHARGE, PLATFORM_FEE | + | Placement (from quote snapshot) |
-| CHARGE_REVERSAL | − | Line cancellation, short delivery, return resolution |
-| PAYMENT_RECEIVED | − | Verified webhook |
-| COD_COLLECTED | − | Admin action at delivery |
-| REFUND_ISSUED | + | Completed refund |
-| ADJUSTMENT | ± | Owner action with reason |
-| SUPPLIER_PAYABLE, DELIVERY_COST, GATEWAY_FEE | internal (not customer balance) | Assignment confirmation, shipment, settlement import |
+| Intent | Order, OrderLine snapshot, quote | Write-once at placement (I-3) |
+| Operations | Assignments, shipments, shipment lines, attempts, returns, line quantities | Change only through transition functions; history in OrderEvent (I-4) |
+| Finance | LedgerEntry, Invoice, CreditNote; Payment and Refund amounts | Insert-only; Payment/Refund **status** changes through transitions |
 
-**Reconciliation views (MVP, manual):**
-- Daily gateway: captured payments vs gateway settlement report (manual upload or API pull in a later session).
-- COD: expected vs recorded collection per executor per day.
-- Refunds: approved vs completed vs gateway status.
-- Supplier payables: confirmed assignments and delivered quantities per supplier, less returns, for a period.
-- Orders not closable: non-zero balance, open returns or refunds.
+Any operational transition that changes what the customer owes writes its financial record **in the same transaction**: e.g. recording 2 bags refused at the door writes a `CHARGE_REVERSAL` and, if those bags were already invoiced, a credit note.
+
+### 10.2 Accounts and the accounting equation
+
+Every entry belongs to one account of one counterparty and carries a signed amount in paise.
+
+> **Sign rule:** for every account, **+ means the counterparty owes the business more; − means the business owes the counterparty more.**
+> **Balance(account) = Σ entry amounts.** Balance > 0: they owe us. Balance < 0: we owe them. Balance = 0: settled.
+
+| Account | Entry types (sign) | Created by |
+| --- | --- | --- |
+| **Customer** (per order) | GOODS_CHARGE (+), DELIVERY_CHARGE (+), PLATFORM_FEE (+) | Placement, from quote snapshot |
+| | CHARGE_REVERSAL (−) | Cancellation, short/damaged/refused at door, accepted return, waived charge |
+| | PAYMENT_RECEIVED (−) | Verified gateway event (I-9) |
+| | COD_COLLECTED (−) | Admin records collection at delivery |
+| | REFUND_PAID (+) | Refund reaches Completed only |
+| | WRITE_OFF (−) | Owner, with reason: amount owed that will not be collected |
+| | ADJUSTMENT (±) | Owner, with reason: goodwill credit (−) or extra charge (+) |
+| **Gateway** | GATEWAY_RECEIVABLE (+) on capture · GATEWAY_REFUND (−) · GATEWAY_FEE (−) · SETTLEMENT_RECEIVED (−) | Webhook, refund, settlement import |
+| **Executor** (per delivery person/partner) | COD_CUSTODY (+) when they collect cash · COD_HANDOVER (−) when they hand it over · DELIVERY_COST (−) · DELIVERY_PAID (+) | Admin actions |
+| **Supplier** | SUPPLIER_PAYABLE (−) on delivered qty × cost snapshot · SUPPLIER_CREDIT (+) for supplier-liable returns/damage (D17) · SUPPLIER_PAID (+) | Delivery recording, return resolution, payment recording |
+
+Customer balance is per order; gateway, executor and supplier balances are reported per counterparty and period. Netting COD cash held by a supplier's driver against that supplier's payable is an Owner settlement: COD_HANDOVER on the executor account and SUPPLIER_PAID on the supplier account for the netted amount.
+
+### 10.3 Worked examples
+
+Base order for all examples: 10 bags of cement at ₹400 each (GST-inclusive) = ₹4,000 goods; delivery charge ₹300; no platform fee; total ₹4,300. Supplier cost ₹360/bag. Supplier's driver delivers. Gateway fee 2% (placeholder). Amounts in rupees for readability; stored in paise.
+
+**Example 1 — Prepaid, delivered in full**
+
+| Step | Account | Entry | Amount | Customer balance |
+| --- | --- | --- | --- | --- |
+| Placement | Customer | GOODS_CHARGE | +4,000 | 4,000 |
+| | Customer | DELIVERY_CHARGE | +300 | 4,300 |
+| Verified payment | Customer | PAYMENT_RECEIVED | −4,300 | 0 |
+| | Gateway | GATEWAY_RECEIVABLE | +4,300 | |
+| Delivered 10 | Supplier | SUPPLIER_PAYABLE | −3,600 | |
+| Settlement | Gateway | GATEWAY_FEE | −86 | |
+| | Gateway | SETTLEMENT_RECEIVED | −4,214 | (gateway balance 0) |
+| Close | Customer balance 0, window ended → **Closed**. Supplier balance −3,600 is paid by period and does not block closure. | | | |
+
+**Example 2 — COD, delivered in full**
+
+| Step | Account | Entry | Amount | Customer balance |
+| --- | --- | --- | --- | --- |
+| Placement | Customer | GOODS_CHARGE + DELIVERY_CHARGE | +4,300 | 4,300 |
+| Delivered 10, cash collected | Customer | COD_COLLECTED | −4,300 | 0 |
+| | Executor | COD_CUSTODY | +4,300 | (driver holds cash) |
+| | Supplier | SUPPLIER_PAYABLE | −3,600 | |
+| Cash handed over | Executor | COD_HANDOVER | −4,300 | (executor balance 0) |
+| Close | Customer balance 0 → **Closed**. | | | |
+
+**Example 3 — Prepaid, partial delivery (2 bags damaged, refused at the door)**
+
+| Step | Account | Entry | Amount | Customer balance |
+| --- | --- | --- | --- | --- |
+| Placement + payment | Customer | charges, PAYMENT_RECEIVED | +4,300, −4,300 | 0 |
+| 8 delivered, 2 refused damaged | Customer | CHARGE_REVERSAL (2 × 400) | −800 | −800 (we owe customer) |
+| | Supplier | SUPPLIER_PAYABLE (8 × 360) | −2,880 | |
+| Refund requested, approved | — | none (status only) | — | −800 |
+| Refund completed via gateway | Customer | REFUND_PAID | +800 | 0 |
+| | Gateway | GATEWAY_REFUND | −800 | |
+| Close | Customer balance 0 → **Closed**. If the refund had **Failed**, the balance stays −800, the refund is Failed, and the close guard blocks closure until it completes. | | | |
+
+Delivery charge is not reversed for a partial delivery in this example; that is a policy choice (D10). COD variant: after the reversal the balance is 3,500; COD_COLLECTED −3,500 brings it to 0 and no refund is needed.
+
+**Example 4 — Prepaid, return after delivery (1 incorrect bag, within window, supplier liable)**
+
+| Step | Account | Entry | Amount | Customer balance |
+| --- | --- | --- | --- | --- |
+| After Example 1 delivery | — | — | — | 0 (supplier −3,600) |
+| Return approved, picked up, received | Customer | CHARGE_REVERSAL | −400 | −400 |
+| | Supplier | SUPPLIER_CREDIT | +360 | (supplier −3,240) |
+| | Finance | Credit note ₹400 if the bag was invoiced (§10.4) | | |
+| Refund completed | Customer | REFUND_PAID | +400 | 0 |
+| | Gateway | GATEWAY_REFUND | −400 | |
+| Close | Return resolved, window ended, balance 0 → **Closed**. | | | |
+
+**Example 5 — COD, customer refuses the whole order at the door**
+
+| Step | Account | Entry | Amount | Customer balance |
+| --- | --- | --- | --- | --- |
+| Placement | Customer | charges | +4,300 | 4,300 |
+| Attempt failed: refused | Customer | CHARGE_REVERSAL (goods) | −4,000 | 300 |
+| Delivery charge — policy D10 | Customer | either CHARGE_REVERSAL (waived) or WRITE_OFF (retained but uncollectable) | −300 | 0 |
+| Goods returned to supplier | Supplier | none (nothing delivered) | — | |
+| | Executor | DELIVERY_COST if return trip is charged (D17) | as agreed | |
+| Close | Balance 0 → **Closed**; customer flagged per COD refusal policy (D5). | | | |
+
+These five examples become automated tests in S10: each must produce exactly these balances.
+
+### 10.4 Invoices and credit notes
+
+The invoice policy is a **required live-mode setting** (§4.1, checklist L4). This document defines the options and their consequences; choosing one is D13.
+
+| Policy | Tax invoice issued | Credit notes needed for | Consequence |
+| --- | --- | --- | --- |
+| `AT_PLACEMENT` | When the order is Placed (after verified payment for prepaid) | Every cancellation, short, damaged or refused quantity, and every return | Most credit notes |
+| `AT_DISPATCH` | Per shipment, when it goes Out for delivery | Quantities short, damaged or refused at the door, and returns | One invoice per shipment |
+| `AT_DELIVERY` | Per shipment, when delivered quantities are recorded, for delivered quantity only | Returns after delivery only | Fewest credit notes; CA must confirm issuing after the goods move is acceptable, and what document travels with the goods (delivery challan / e-way bill where applicable) |
+
+Common rules for every policy:
+- Delivery charge and platform fees are invoiced with the order's first invoice; their tax treatment is D13.
+- A credit note is issued in the same transaction as the CHARGE_REVERSAL for already-invoiced quantities; never for quantities not yet invoiced.
+- Reconciliation check per order: **Σ invoices − Σ credit notes = Σ charges − Σ charge reversals for invoiced lines**. Part of the close guard (§9.1).
+- In test mode every policy can be exercised; documents are watermarked and use a test series.
+
+### 10.5 Reconciliation views (MVP, manual)
+
+- **Gateway:** captured payments and refunds vs settlement report (manual upload in MVP); gateway account balance per settlement period should reach 0.
+- **COD custody:** executor accounts with balance > 0 after the handover deadline.
+- **Refunds:** approved vs processing vs failed vs completed, with age.
+- **Supplier payables:** supplier account balances per period, with delivered quantities and credits.
+- **Orders not closable:** failing close-guard conditions, per order.
+- **Invoice check:** orders where invoices − credit notes ≠ net invoiced charges.
 
 Supplier payouts themselves are made outside the system in v1 and recorded as settled.
 
@@ -578,14 +782,14 @@ Nothing below is decided by this document. Placeholders are marked where used.
 | D7 | Stack, hosting vendor, SMS/WhatsApp provider | §3 recommendation | Owner | S2 |
 | D8 | Launch SKU list (30–50) | — | Owner | Catalogue seed |
 | D9 | Platform fees: whether to charge, labels shown to customers | — | Owner | Fee rules, checkout display |
-| D10 | Return policy: window, change-of-mind, redelivery and restocking charges | — | Owner (+ lawyer for terms) | Returns, order closure |
+| D10 | Return policy: window length, change-of-mind, redelivery and restocking charges, whether delivery charge is reversed on partial delivery or refusal | — | Owner (+ lawyer for terms) | Returns, order closure, Examples 3 and 5 |
 | D11 | Supplier confirmation deadline and escalation limit | Placeholder: 4 working hours | Owner | Timers |
 | D12 | Offer freshness window | Placeholder: 7 days | Owner | Availability |
-| D13 | GST on delivery charges and platform fees; invoice timing (placement vs dispatch); credit-note rules | — | **CA** | Invoicing |
+| D13 | Invoice policy (`AT_PLACEMENT` / `AT_DISPATCH` / `AT_DELIVERY`, §10.4); GST on delivery charges and platform fees; credit-note rules; documents that travel with goods (delivery challan / e-way bill where applicable) | — | **CA** | Live invoicing (checklist L4) |
 | D14 | COD refund method | Bank/UPI transfer | Owner | Refund workflow |
 | D15 | Delivery OTP mandatory | Mandatory with Owner override | Owner | Delivered transition |
 | D16 | Privacy notice, data retention, consent text (incl. future location tracking) | — | **Lawyer** | Launch |
-| D17 | Supplier terms: damaged/incorrect goods liability, payment terms, return-to-supplier costs | — | Owner (+ lawyer) | Returns, payables |
+| D17 | Supplier terms: damaged/incorrect goods liability, payment terms, return-to-supplier costs, COD cash handover deadline and netting, and a rule that suppliers' drivers hand over only the platform's documents (no supplier bills, branding or price lists to customers) | — | Owner (+ lawyer) | Returns, payables, I-1 in practice, supplier verification (L9) |
 
 ---
 
@@ -597,15 +801,15 @@ Twelve sessions, each one PR with one scope. Risk tier per the operating model: 
 | --- | --- | --- | --- |
 | S1 | Design | This spec (v1.1) + independent validation; `DOCTRINE.md`, `CONSTRAINTS_CARD.md`; ADR-001 operating model, ADR-002 Product/Offer/Assignment, ADR-003 modular monolith + worker | — |
 | S2 | Implementation | Repo scaffold, operating-model templates, web + worker processes, DB + migrations for all MVP tables, logging, error monitoring, health checks, CI | High |
-| S3 | Implementation | `config`: business profile, test/live gate, rule sets and versioning, zones, slots, reason codes | High |
+| S3 | Implementation | `config`: business profile, test/live gate with go-live checklist and automatic revocation, invoice policy setting, rule sets and versioning, zones, slots, reason codes | High |
 | S4 | Implementation | Catalogue and storefront browsing | Low |
 | S5 | Implementation | `pricing` quote engine, cart, quantity rules, pincode gate | Medium |
 | S6 | Implementation | Identity (OTP, admin auth, roles), addresses, checkout, idempotent placement, ledger charges | High |
 | S7 | Implementation | Payments: gateway, verified idempotent webhooks, expiry, late-payment refunds, COD | High |
 | S8 | Implementation | Admin orders, suppliers/offers, assignment with deadlines and timeouts | High |
 | S9 | Implementation | Shipments, executors, attempts, OTP/proof delivery, rescheduling | High |
-| S10 | Implementation | Returns, pickups, refunds, invoices and credit notes, reconciliation views | High |
+| S10 | Implementation | Returns, pickups, refunds, invoices and credit notes under all three invoice policies, ledger accounts, reconciliation views; §10.3 examples as automated tests | High |
 | S11 | Implementation | Notifications via worker, templates, admin rules/settings screens polish | Medium |
-| S12 | Investigation | Load test against §3.1 design target, restore test, end-to-end test orders with real suppliers in test mode, launch checklist (D1, D13, D16 closed) | Medium |
+| S12 | Investigation | Load test per §3.7, restore test, end-to-end test orders with real suppliers in test mode, go-live checklist L1–L10 | Medium |
 
 Suggested `ACTIVE_ARCHITECTURE.md` rows once built: one per module in §3.5, each pointing to this document until a module earns its own design doc.
